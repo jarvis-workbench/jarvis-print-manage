@@ -29,8 +29,8 @@
     "wait-on": "^9.0.4"
   },
   "build": {
-    "appId": "hs.print.iiot.eu.cc",
-    "productName": "虹色打印机助手",
+    "appId": "cc.eu.iiot.hs.tool",
+    "productName": "虹色图文助手",
     "files": [
       "dist/**/*",
       "electron/**/*",

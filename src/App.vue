@@ -16,8 +16,8 @@ function handleMenuSelect(path) {
 <template>
   <el-container class="shell">
     <el-aside class="sidebar" width="190px">
-      <div class="brand">虹色打印机助手</div>
-      <div class="brand-subtitle">Printer Driver Toolkit</div>
+      <div class="brand">虹色图文助手</div>
+      <div class="brand-subtitle">图文行业-计算机一站式解决方案</div>
 
       <el-menu class="nav-menu" :default-active="activePath" @select="handleMenuSelect">
         <el-menu-item index="/">
