@@ -89,7 +89,7 @@ onMounted(loadSettings)
         </el-select>
       </el-form-item>
 
-      <el-form-item label="驱动备份目录">
+      <el-form-item label="打印机驱动备份目录">
         <el-input
           v-model="backupDir"
           readonly
