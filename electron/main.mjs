@@ -1,16 +1,14 @@
 ﻿import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } from 'electron'
-import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
 import { Worker } from 'node:worker_threads'
 import { loadPsScript } from './config/script/ps/index.mjs'
+import { runPowerShellJson } from './powershell.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const execFileAsync = promisify(execFile)
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
 const APP_TITLE = '虹色图文助手'
 const THEME_MODES = new Set(['light', 'dark', 'system'])
@@ -19,6 +17,7 @@ const BACKUP_META_FILE_NAME = 'driver-backup.json'
 const TRAY_ICON_NAME = 'tray.png'
 const PRINTER_STATE_POLL_INTERVAL_MS = 2000
 const SYSTEM_SETTINGS_RELATIVE_PATH = path.join('config', 'system.json')
+const POWERSHELL_TIMEOUT_MS = 30_000
 
 let mainWindow = null
 let tray = null
@@ -70,7 +69,7 @@ function stopPrinterStateWorker() {
 
 function startPrinterStateWorker() {
   if (printerStateWorker || appIsQuitting) return
-  const workerPath = path.join(__dirname, 'printer-state-worker.mjs')
+  const workerPath = path.join(__dirname, 'worker', 'printer-state-worker.mjs')
   printerStateWorker = new Worker(workerPath, {
     workerData: {
       pollIntervalMs: PRINTER_STATE_POLL_INTERVAL_MS,
@@ -123,66 +122,9 @@ function toPsSingleQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`
 }
 
-async function runPowerShell(script) {
-  const wrappedScript = `
-    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    ${script}
-  `
-  const { stdout, stderr } = await execFileAsync(
-    'powershell.exe',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', wrappedScript],
-    {
-      windowsHide: true,
-      maxBuffer: 20 * 1024 * 1024,
-    },
-  )
-
-  return {
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-  }
-}
-
-async function runPowerShellJson(script) {
-  const wrappedJsonScript = `
-    $ErrorActionPreference = 'Stop'
-    $ProgressPreference = 'SilentlyContinue'
-    $__codexResult = & {
-      ${script}
-    }
-    if ($null -eq $__codexResult) {
-      $__codexJson = 'null'
-    } elseif ($__codexResult -is [string]) {
-      $__codexJson = $__codexResult
-    } else {
-      $__codexJson = $__codexResult | ConvertTo-Json -Depth 12 -Compress
-    }
-    if ($null -eq $__codexJson -or $__codexJson -eq '') {
-      $__codexJson = 'null'
-    }
-    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__codexJson))
-  `
-
-  const { stdout, stderr } = await runPowerShell(wrappedJsonScript)
-  const base64Text = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || ''
-  const jsonText = Buffer.from(base64Text, 'base64').toString('utf8').trim()
-
-  if (!jsonText) {
-    throw new Error(stderr || 'PowerShell returned empty output.')
-  }
-
-  try {
-    return JSON.parse(jsonText)
-  } catch {
-    throw new Error(stderr || `Failed to parse PowerShell JSON output: ${jsonText}`)
-  }
-}
-
 async function openSystemAddPrinterWizard() {
   const script = await loadPsScript('open-system-add-printer-wizard')
-  return runPowerShellJson(script)
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
 function getDefaultBackupDir() {
@@ -226,6 +168,49 @@ function isVirtualPrinter(printer) {
   return false
 }
 
+function normalizeStringArray(value) {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((item) => String(item || '').trim()).filter(Boolean))]
+  }
+  const text = String(value || '').trim()
+  if (!text) return []
+  return [...new Set(text.split(/[;,]/).map((item) => item.trim()).filter(Boolean))]
+}
+
+function normalizeIdentityFields(entry = {}) {
+  const hardwareIds = normalizeStringArray(entry.hardwareIds || entry.hardwareIdList || entry.hardwareId)
+  const pnpDeviceId = String(entry.pnpDeviceId || '').trim()
+  const usbVid = String(entry.usbVid || '').trim().toUpperCase()
+  const usbPid = String(entry.usbPid || '').trim().toUpperCase()
+  const usbVidPidRaw = String(entry.usbVidPid || '').trim().toUpperCase()
+  const usbVidPid = usbVidPidRaw || (usbVid && usbPid ? `${usbVid}:${usbPid}` : '')
+  const deviceSerial = String(entry.deviceSerial || '').trim()
+
+  return {
+    pnpDeviceId,
+    hardwareIds,
+    usbVid,
+    usbPid,
+    usbVidPid,
+    deviceSerial,
+  }
+}
+
+function buildIndexIdentityKey(entry = {}) {
+  const normalized = normalizeIdentityFields(entry)
+  if (normalized.pnpDeviceId) return `pnp:${normalized.pnpDeviceId.toLowerCase()}`
+  if (normalized.usbVidPid && normalized.deviceSerial) {
+    return `usb:${normalized.usbVidPid.toLowerCase()}:${normalized.deviceSerial.toLowerCase()}`
+  }
+  if (normalized.hardwareIds.length > 0) {
+    return `hw:${normalized.hardwareIds[0].toLowerCase()}`
+  }
+  if (normalized.usbVidPid) {
+    return `usb:${normalized.usbVidPid.toLowerCase()}`
+  }
+  return ''
+}
+
 function normalizeIndex(raw) {
   const entries = Array.isArray(raw?.entries) ? raw.entries : []
   return {
@@ -245,6 +230,7 @@ function normalizeIndex(raw) {
         portHostAddress: String(entry.portHostAddress || ''),
         portNumber: String(entry.portNumber || ''),
         environment: String(entry.environment || ''),
+        ...normalizeIdentityFields(entry),
       })),
   }
 }
@@ -303,6 +289,7 @@ async function scanBackupDirForIndex(backupDir) {
         portHostAddress: String(meta.portHostAddress || ''),
         portNumber: String(meta.portNumber || ''),
         environment: String(meta.environment || ''),
+        ...normalizeIdentityFields(meta),
       })
     } catch {
       // ignore invalid metadata file
@@ -327,7 +314,13 @@ async function ensureBackupIndex(backupDir) {
 async function upsertIndexEntry(backupDir, nextEntry) {
   const indexObj = await ensureBackupIndex(backupDir)
   const key = nextEntry.printerName.toLowerCase()
-  const remaining = indexObj.entries.filter((entry) => entry.printerName.toLowerCase() !== key)
+  const nextIdentityKey = buildIndexIdentityKey(nextEntry)
+  const remaining = indexObj.entries.filter((entry) => {
+    if (entry.printerName.toLowerCase() === key) return false
+    if (!nextIdentityKey) return true
+    const existingIdentityKey = buildIndexIdentityKey(entry)
+    return !existingIdentityKey || existingIdentityKey !== nextIdentityKey
+  })
   remaining.push(nextEntry)
   return writeIndexFile(backupDir, {
     ...indexObj,
@@ -495,7 +488,7 @@ async function writeSettings(nextSettings) {
 
 async function getInstalledPrinters() {
   const script = await loadPsScript('list-installed-printers')
-  const data = await runPowerShellJson(script)
+  const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
   const list = Array.isArray(data) ? data : data ? [data] : []
   const filtered = list.filter((item) => !isVirtualPrinter(item))
   const normalized = await Promise.all(
@@ -509,7 +502,7 @@ async function getInstalledPrinters() {
 
 async function listUsbPrinterPorts() {
   const script = await loadPsScript('list-usb-printer-ports')
-  const data = await runPowerShellJson(script)
+  const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
   if (Array.isArray(data)) {
     return data.map((item) => String(item))
   }
@@ -527,7 +520,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     PRINTER_NAME: toPsSingleQuote(printerName),
     TARGET_ROOT: toPsSingleQuote(targetRoot),
   })
-  const result = await runPowerShellJson(script)
+  const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
   const backupPath = result.backupDir
   const infRelativePath = await findInfRelativePath(backupPath, path.basename(result.infPath || ''))
 
@@ -540,6 +533,12 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     portName: String(result.portName || ''),
     portHostAddress: String(result.portHostAddress || ''),
     portNumber: String(result.portNumber || ''),
+    pnpDeviceId: String(result.pnpDeviceId || ''),
+    hardwareIds: normalizeStringArray(result.hardwareIds),
+    usbVid: String(result.usbVid || ''),
+    usbPid: String(result.usbPid || ''),
+    usbVidPid: String(result.usbVidPid || ''),
+    deviceSerial: String(result.deviceSerial || ''),
     infRelativePath,
     backupAt: new Date().toISOString(),
     method: result.method,
@@ -563,6 +562,12 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     portHostAddress: metadata.portHostAddress,
     portNumber: metadata.portNumber,
     environment: metadata.environment,
+    pnpDeviceId: metadata.pnpDeviceId,
+    hardwareIds: metadata.hardwareIds,
+    usbVid: metadata.usbVid,
+    usbPid: metadata.usbPid,
+    usbVidPid: metadata.usbVidPid,
+    deviceSerial: metadata.deviceSerial,
   })
 
   return {
@@ -578,7 +583,9 @@ async function installPrinterFromBackup({
   portHostAddressOverride = '',
 }) {
   const indexObj = await ensureBackupIndex(backupDir)
+  const normalizedPrinterName = String(printerName || '').trim().toLowerCase()
   const entry = indexObj.entries.find((item) => item.printerName === printerName)
+    || indexObj.entries.find((item) => item.printerName.toLowerCase() === normalizedPrinterName)
   if (!entry) {
     throw new Error(`No backup index entry found for printer: ${printerName}`)
   }
@@ -621,7 +628,7 @@ async function installPrinterFromBackup({
     INF_PATH: toPsSingleQuote(infPath),
     BACKUP_PATH: toPsSingleQuote(backupPath),
   })
-  return runPowerShellJson(script)
+  return runPowerShellJson(script, { timeoutMs: 120_000 })
 }
 
 async function pingHost(host) {
@@ -632,14 +639,14 @@ async function pingHost(host) {
   const script = await loadPsScript('ping-host', {
     HOST_VALUE: toPsSingleQuote(targetHost),
   })
-  return runPowerShellJson(script)
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
 async function uninstallPrinter({ printerName }) {
   const script = await loadPsScript('uninstall-printer', {
     PRINTER_NAME: toPsSingleQuote(printerName),
   })
-  return runPowerShellJson(script)
+  return runPowerShellJson(script, { timeoutMs: 120_000 })
 }
 
 function getTrayIcon() {

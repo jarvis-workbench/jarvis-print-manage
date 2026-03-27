@@ -13,6 +13,39 @@
       throw "Driver not found for printer: $printerName"
     }
     $port = Get-PrinterPort -Name $printer.PortName -ErrorAction SilentlyContinue | Select-Object -First 1
+    $wmiPrinter = Get-CimInstance -ClassName Win32_Printer -Filter ("Name = '{0}'" -f ($printer.Name -replace "'", "''")) -ErrorAction SilentlyContinue | Select-Object -First 1
+    $pnpDeviceId = if ($wmiPrinter) { [string]$wmiPrinter.PNPDeviceID } else { '' }
+    $pnpEntity = $null
+    if ($pnpDeviceId) {
+      foreach ($candidate in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+        if ($candidate -and [string]$candidate.DeviceID -eq $pnpDeviceId) {
+          $pnpEntity = $candidate
+          break
+        }
+      }
+    }
+    $hardwareIds = @()
+    if ($pnpEntity -and $pnpEntity.HardwareID) {
+      $hardwareIds = @($pnpEntity.HardwareID | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    }
+    if (-not $hardwareIds -and $pnpDeviceId) {
+      $hardwareIds = @($pnpDeviceId)
+    }
+    $usbVid = ''
+    $usbPid = ''
+    $usbVidPid = ''
+    $deviceSerial = ''
+    if ($pnpDeviceId -match '(?i)VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
+      $usbVid = $matches[1].ToUpper()
+      $usbPid = $matches[2].ToUpper()
+      $usbVidPid = "$usbVid`:$usbPid"
+    }
+    if ($pnpDeviceId -like 'USBPRINT\*' -or $pnpDeviceId -like 'USB\VID_*') {
+      $parts = $pnpDeviceId -split '\\'
+      if ($parts.Count -ge 3) {
+        $deviceSerial = [string]$parts[$parts.Count - 1]
+      }
+    }
 
     $safeName = $driver.Name -replace '[\\/:*?"<>|]', '_'
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -324,6 +357,12 @@
       portName = $printer.PortName
       portHostAddress = if ($port) { $port.PrinterHostAddress } else { '' }
       portNumber = if ($port) { $port.PortNumber } else { '' }
+      pnpDeviceId = $pnpDeviceId
+      hardwareIds = $hardwareIds
+      usbVid = $usbVid
+      usbPid = $usbPid
+      usbVidPid = $usbVidPid
+      deviceSerial = $deviceSerial
       infPath = $effectiveInfPath
       backupDir = $dest
       method = if ($usedPnpUtil) { 'pnputil-export-driver' } else { 'copy-required-files' }

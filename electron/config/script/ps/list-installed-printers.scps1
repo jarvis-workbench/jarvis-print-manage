@@ -1,0 +1,112 @@
+
+    $ErrorActionPreference = 'Stop'
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($spooler -and $spooler.Status -ne 'Running') {
+      try {
+        Start-Service -Name spooler -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
+      } catch {}
+    }
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if (-not $spooler -or $spooler.Status -ne 'Running') {
+      @() | ConvertTo-Json -Compress
+      return
+    }
+
+    $printers = @(Get-Printer -ErrorAction SilentlyContinue | Select-Object Name, DriverName, PortName, Shared, ShareName, PrinterStatus, WorkOffline)
+    $drivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object Name, Manufacturer, MajorVersion, DriverVersion, InfPath, PrinterEnvironment)
+    $ports = @(Get-PrinterPort -ErrorAction SilentlyContinue | Select-Object Name, PrinterHostAddress, PortNumber)
+
+    $portMap = @{}
+    foreach ($port in $ports) {
+      if ($port -and $port.Name) {
+        $portMap[$port.Name] = $port
+      }
+    }
+
+    $wmiPrinterMap = @{}
+    foreach ($wmiPrinter in (Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue)) {
+      if ($wmiPrinter -and $wmiPrinter.Name) {
+        $wmiPrinterMap[$wmiPrinter.Name] = $wmiPrinter
+      }
+    }
+
+    $pnpEntityMap = @{}
+    foreach ($pnpEntity in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+      if ($pnpEntity -and $pnpEntity.DeviceID) {
+        $pnpEntityMap[[string]$pnpEntity.DeviceID] = $pnpEntity
+      }
+    }
+
+    $result = foreach ($printer in $printers) {
+      $driver = $drivers | Where-Object { $_.Name -eq $printer.DriverName } | Select-Object -First 1
+      $port = $null
+      if ($portMap.ContainsKey($printer.PortName)) {
+        $port = $portMap[$printer.PortName]
+      }
+
+      $wmiPrinter = $null
+      if ($wmiPrinterMap.ContainsKey($printer.Name)) {
+        $wmiPrinter = $wmiPrinterMap[$printer.Name]
+      }
+
+      $pnpDeviceId = if ($wmiPrinter) { [string]$wmiPrinter.PNPDeviceID } else { '' }
+      $hardwareIds = @()
+      if ($pnpDeviceId -and $pnpEntityMap.ContainsKey($pnpDeviceId)) {
+        $rawHardwareIds = @($pnpEntityMap[$pnpDeviceId].HardwareID)
+        if ($rawHardwareIds) {
+          $hardwareIds = @($rawHardwareIds | ForEach-Object { [string]$_ } | Where-Object { $_ })
+        }
+      }
+      if (-not $hardwareIds -and $pnpDeviceId) {
+        $hardwareIds = @($pnpDeviceId)
+      }
+
+      $usbVid = ''
+      $usbPid = ''
+      $usbVidPid = ''
+      $deviceSerial = ''
+      if ($pnpDeviceId -match '(?i)VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
+        $usbVid = $matches[1].ToUpper()
+        $usbPid = $matches[2].ToUpper()
+        $usbVidPid = "$usbVid`:$usbPid"
+      }
+      if ($pnpDeviceId -like 'USBPRINT\*' -or $pnpDeviceId -like 'USB\VID_*') {
+        $parts = $pnpDeviceId -split '\\'
+        if ($parts.Count -ge 3) {
+          $deviceSerial = [string]$parts[$parts.Count - 1]
+        }
+      }
+
+      [PSCustomObject]@{
+        name = $printer.Name
+        driverName = $printer.DriverName
+        portName = $printer.PortName
+        portHostAddress = if ($port) { $port.PrinterHostAddress } else { '' }
+        portNumber = if ($port) { $port.PortNumber } else { '' }
+        shared = [bool]$printer.Shared
+        shareName = $printer.ShareName
+        printerStatus = $printer.PrinterStatus
+        workOffline = [bool]$printer.WorkOffline
+        pnpDeviceId = $pnpDeviceId
+        hardwareIds = $hardwareIds
+        usbVid = $usbVid
+        usbPid = $usbPid
+        usbVidPid = $usbVidPid
+        deviceSerial = $deviceSerial
+        driver = if ($driver) {
+          [PSCustomObject]@{
+            name = $driver.Name
+            manufacturer = $driver.Manufacturer
+            majorVersion = $driver.MajorVersion
+            driverVersion = $driver.DriverVersion
+            infPath = $driver.InfPath
+            environment = $driver.PrinterEnvironment
+          }
+        } else {
+          $null
+        }
+      }
+    }
+    $result | Sort-Object name | ConvertTo-Json -Depth 6 -Compress
+  

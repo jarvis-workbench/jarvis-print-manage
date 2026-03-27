@@ -48,7 +48,7 @@ async function readScriptTemplate(name) {
     return scriptCache.get(scriptName)
   }
 
-  const fileName = scriptName.endsWith('.ps1s') ? scriptName : `${scriptName}.ps1s`
+  const fileName = scriptName.endsWith('.scps1') ? scriptName : `${scriptName}.scps1`
   const absPath = path.join(__dirname, fileName)
   const text = await fs.readFile(absPath, 'utf8')
   scriptCache.set(scriptName, text)

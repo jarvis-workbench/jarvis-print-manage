@@ -7,6 +7,7 @@ import { useRuntimeStore } from '../stores/runtime'
 
 const loading = ref(false)
 const savingAction = ref('')
+const backingUpNames = ref(new Set())
 const uninstalling = ref(false)
 const installWizardVisible = ref(false)
 const installWizardSubmitting = ref(false)
@@ -27,6 +28,7 @@ const runtimeStore = useRuntimeStore()
 const { settings, PrinterServerManage } = storeToRefs(runtimeStore)
 const waitingUsbReconnectNames = ref(new Set())
 let removePrinterStateUpdatedListener = null
+let loadPrintersSeq = 0
 
 const rows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
 
@@ -39,8 +41,27 @@ const installWizardPrimaryText = computed(() => {
   return '开始安装'
 })
 
+function clearInstallWizardIpHint() {
+  installWizardIpStatus.value = ''
+  installWizardIpMessage.value = ''
+}
+
 function normalizePrinterKey(value) {
   return String(value || '').trim().toLowerCase()
+}
+
+function markBackingUp(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(backingUpNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  backingUpNames.value = next
+}
+
+function isBackingUp(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? backingUpNames.value.has(key) : false
 }
 
 function parseIpCandidate(rawValue) {
@@ -118,12 +139,24 @@ function canBackup(row) {
   return row.installed && !row.backup
 }
 
+function showWaitingUsbHint(row) {
+  return hasWaitingUsbReconnect(row)
+}
+
 function canInstall(row) {
-  return !row.installed && row.backup && !hasWaitingUsbReconnect(row)
+  return !row.installed && row.backup && !showWaitingUsbHint(row)
 }
 
 function canUninstall(row) {
-  return row.installed
+  return row.installed && !showWaitingUsbHint(row)
+}
+
+function getActionMode(row) {
+  if (canBackup(row)) return 'backup'
+  if (showWaitingUsbHint(row)) return 'waiting'
+  if (canInstall(row)) return 'install'
+  if (canUninstall(row)) return 'uninstall'
+  return 'none'
 }
 
 function driverStatusType(row) {
@@ -185,6 +218,7 @@ function printerAvailabilityType(row) {
 async function loadPrinters(options = {}) {
   const silent = Boolean(options?.silent)
   if (!window.eleDrive?.listInstalledPrinters || !window.eleDrive?.getDriverIndex) return
+  const seq = ++loadPrintersSeq
   if (!silent) {
     loading.value = true
     error.value = ''
@@ -194,6 +228,7 @@ async function loadPrinters(options = {}) {
       window.eleDrive.listInstalledPrinters(),
       window.eleDrive.getDriverIndex(),
     ])
+    if (seq !== loadPrintersSeq) return
     runtimeStore.setPrinterSnapshot({
       installedPrinters: installed,
       driverIndexEntries: indexPayload?.index?.entries || [],
@@ -201,10 +236,12 @@ async function loadPrinters(options = {}) {
     })
     reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
   } catch (err) {
+    if (seq !== loadPrintersSeq) return
     if (!silent) {
       error.value = err instanceof Error ? err.message : String(err)
     }
   } finally {
+    if (seq !== loadPrintersSeq) return
     if (!silent) {
       loading.value = false
     }
@@ -249,17 +286,18 @@ function applyUninstallOptimistically(row) {
 
 async function backupDriver(row) {
   if (!window.eleDrive?.backupPrinterDriver) return
-  savingAction.value = `backup:${row.printerName}`
+  markBackingUp(row?.printerName, true)
   error.value = ''
   try {
     await window.eleDrive.backupPrinterDriver({ printerName: row.printerName })
+    runtimeStore.applyOptimisticBackup({ printerName: row.printerName })
     ElMessage.success('备份成功')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
     ElMessage.error('备份失败')
   } finally {
-    savingAction.value = ''
-    await loadPrinters()
+    markBackingUp(row?.printerName, false)
+    await loadPrinters({ silent: true })
   }
 }
 
@@ -323,10 +361,10 @@ async function runInstallTask(row, installPayload) {
     error.value = detail
     ElMessage.error(`安装失败：${detail}`)
   } finally {
-    savingAction.value = ''
     if (!refreshedInTry) {
-      void loadPrinters({ silent: true })
+      await loadPrinters({ silent: true })
     }
+    savingAction.value = ''
   }
   return success
 }
@@ -339,7 +377,7 @@ async function submitInstallWizard() {
 
   const targetPrinterName = installWizardPrinterName.value.trim()
   const installPayload = {
-    printerName: row.printerName,
+    printerName: row.backupPrinterName || row.printerName,
     targetPrinterName,
     portHostAddressOverride: installWizardNeedsIpStep.value ? installWizardIp.value.trim() : '',
   }
@@ -360,6 +398,7 @@ async function handleInstallWizardNext() {
   if (installWizardBusy.value) return
   installWizardAdvancing.value = true
   try {
+    clearInstallWizardIpHint()
     const row = installWizardRow.value
     if (!row) return
 
@@ -390,8 +429,7 @@ async function handleInstallWizardNext() {
       }
 
       installWizardIpChecking.value = true
-      installWizardIpStatus.value = ''
-      installWizardIpMessage.value = ''
+      clearInstallWizardIpHint()
       try {
         const pingResult = await window.eleDrive.pingHost({ host })
         if (!pingResult?.reachable) {
@@ -421,12 +459,18 @@ async function handleInstallWizardNext() {
 async function handleInstallWizardUseCurrentIp() {
   if (uninstalling.value) return
   if (installWizardBusy.value) return
-  const host = installWizardIp.value.trim()
-  if (!isValidIpv4(host)) {
-    ElMessage.warning('请输入有效的IP地址')
-    return
+  installWizardAdvancing.value = true
+  try {
+    clearInstallWizardIpHint()
+    const host = installWizardIp.value.trim()
+    if (!isValidIpv4(host)) {
+      ElMessage.warning('请输入有效的IP地址')
+      return
+    }
+    await submitInstallWizard()
+  } finally {
+    installWizardAdvancing.value = false
   }
-  await submitInstallWizard()
 }
 
 function handleInstallWizardPrev() {
@@ -611,44 +655,52 @@ onUnmounted(() => {
       <el-table-column label="操作" width="190" align="center">
         <template #default="{ row }">
           <div class="action-row">
-            <el-button
-              v-if="canBackup(row)"
-              type="primary"
-              size="small"
-              :loading="savingAction === `backup:${row.printerName}`"
-              @click="backupDriver(row)"
-            >
-              <upload theme="outline" size="13" />
-              <span>备份</span>
-            </el-button>
+            <div class="action-slot">
+              <el-button
+                v-if="getActionMode(row) === 'backup'"
+                type="primary"
+                size="small"
+                :loading="isBackingUp(row)"
+                @click="backupDriver(row)"
+              >
+                <upload theme="outline" size="13" />
+                <span>备份</span>
+              </el-button>
 
-            <el-tag v-if="hasWaitingUsbReconnect(row)" type="warning" effect="plain" size="small">
-              等待打印机USB重新接入
-            </el-tag>
+              <el-tag
+                v-else-if="getActionMode(row) === 'waiting'"
+                class="usb-wait-tag"
+                type="warning"
+                effect="plain"
+                size="small"
+              >
+                等待打印机USB重新接入
+              </el-tag>
 
-            <el-button
-              v-if="canInstall(row)"
-              type="success"
-              size="small"
-              :loading="savingAction === `install:${row.printerName}`"
-              :disabled="uninstalling"
-              @click="openInstallWizard(row)"
-            >
-              <download theme="outline" size="13" />
-              <span>安装</span>
-            </el-button>
+              <el-button
+                v-else-if="getActionMode(row) === 'install'"
+                type="success"
+                size="small"
+                :loading="savingAction === `install:${row.printerName}`"
+                :disabled="uninstalling || installFlowActive"
+                @click="openInstallWizard(row)"
+              >
+                <download theme="outline" size="13" />
+                <span>安装</span>
+              </el-button>
 
-            <el-button
-              v-if="canUninstall(row)"
-              type="danger"
-              size="small"
-              :loading="savingAction === `uninstall:${row.printerName}`"
-              :disabled="uninstalling || installFlowActive"
-              @click="uninstallDriver(row)"
-            >
-              <delete theme="outline" size="13" />
-              <span>卸载</span>
-            </el-button>
+              <el-button
+                v-else-if="getActionMode(row) === 'uninstall'"
+                type="danger"
+                size="small"
+                :loading="savingAction === `uninstall:${row.printerName}`"
+                :disabled="uninstalling || installFlowActive"
+                @click="uninstallDriver(row)"
+              >
+                <delete theme="outline" size="13" />
+                <span>卸载</span>
+              </el-button>
+            </div>
           </div>
         </template>
       </el-table-column>
@@ -726,6 +778,9 @@ onUnmounted(() => {
                   <a
                     v-if="installWizardIpStatus === 'fail'"
                     class="install-wizard-use-ip-link"
+                    :class="{ 'is-disabled': installWizardBusy }"
+                    :aria-disabled="installWizardBusy ? 'true' : 'false'"
+                    :tabindex="installWizardBusy ? -1 : 0"
                     href="#"
                     @click.prevent="handleInstallWizardUseCurrentIp"
                   >

@@ -256,6 +256,16 @@ p {
   gap: 4px;
   flex-wrap: nowrap;
   white-space: nowrap;
+  min-height: 34px;
+  align-items: center;
+}
+
+.action-slot {
+  width: 136px;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .action-row .el-button {
@@ -315,6 +325,12 @@ p {
   max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.action-row .usb-wait-tag {
+  max-width: 136px;
+  transition: none !important;
+  animation: none !important;
 }
 
 .printer-cell {
@@ -422,6 +438,15 @@ p {
 
 .install-wizard-use-ip-link:hover {
   color: #c9352b;
+}
+
+.install-wizard-use-ip-link.is-disabled,
+.install-wizard-use-ip-link.is-disabled:visited,
+.install-wizard-use-ip-link.is-disabled:hover {
+  color: #9ba5ba;
+  cursor: not-allowed;
+  pointer-events: none;
+  text-decoration: none;
 }
 
 .install-wizard-overlay {
@@ -735,6 +760,12 @@ p {
 
 :root[data-theme='dark'] .install-wizard-use-ip-link:visited {
   color: #ff7b72;
+}
+
+:root[data-theme='dark'] .install-wizard-use-ip-link.is-disabled,
+:root[data-theme='dark'] .install-wizard-use-ip-link.is-disabled:visited,
+:root[data-theme='dark'] .install-wizard-use-ip-link.is-disabled:hover {
+  color: #6f7a92;
 }
 
 :root[data-theme='dark'] .install-wizard-footer .el-button--primary {

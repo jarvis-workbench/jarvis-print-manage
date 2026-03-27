@@ -1,9 +1,8 @@
-﻿import { execFile } from 'node:child_process'
-import { parentPort, workerData } from 'node:worker_threads'
-import { promisify } from 'node:util'
+﻿import { parentPort, workerData } from 'node:worker_threads'
+import { runPowerShellJson } from '../powershell.mjs'
 
-const execFileAsync = promisify(execFile)
 const pollIntervalMs = Math.max(Number(workerData?.pollIntervalMs) || 2000, 1000)
+const WORKER_POWERSHELL_TIMEOUT_MS = 30_000
 
 let timer = null
 let seq = 0
@@ -41,6 +40,15 @@ function pick(obj, keys, fallback = undefined) {
     }
   }
   return fallback
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((item) => String(item || '').trim()).filter(Boolean))]
+  }
+  const text = String(value || '').trim()
+  if (!text) return []
+  return [...new Set(text.split(/[;,]/).map((item) => item.trim()).filter(Boolean))]
 }
 
 function toAvailability(printer) {
@@ -99,6 +107,12 @@ function normalizePrinters(raw) {
       queueStatus: pick(item, ['queueStatus', 'QueueStatus'], ''),
       shared: toBool(pick(item, ['shared', 'Shared'], false)),
       shareName: String(pick(item, ['shareName', 'ShareName'], '')),
+      pnpDeviceId: String(pick(item, ['pnpDeviceId', 'PnpDeviceId'], '')),
+      hardwareIds: normalizeStringList(pick(item, ['hardwareIds', 'HardwareIds', 'hardwareIdList'], [])),
+      usbVid: String(pick(item, ['usbVid', 'UsbVid'], '')),
+      usbPid: String(pick(item, ['usbPid', 'UsbPid'], '')),
+      usbVidPid: String(pick(item, ['usbVidPid', 'UsbVidPid'], '')),
+      deviceSerial: String(pick(item, ['deviceSerial', 'DeviceSerial'], '')),
       availability: toAvailability(item),
     }))
     .filter((item) => item.name)
@@ -178,56 +192,6 @@ function diffState(prev, next) {
   }
 }
 
-async function runPowerShell(script) {
-  const wrappedScript = `
-    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    ${script}
-  `
-  const { stdout, stderr } = await execFileAsync(
-    'powershell.exe',
-    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', wrappedScript],
-    {
-      windowsHide: true,
-      maxBuffer: 20 * 1024 * 1024,
-    },
-  )
-
-  return {
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-  }
-}
-
-async function runPowerShellJson(script) {
-  const wrappedJsonScript = `
-    $ErrorActionPreference = 'Stop'
-    $ProgressPreference = 'SilentlyContinue'
-    $__codexResult = & {
-      ${script}
-    }
-    if ($null -eq $__codexResult) {
-      $__codexJson = 'null'
-    } elseif ($__codexResult -is [string]) {
-      $__codexJson = $__codexResult
-    } else {
-      $__codexJson = $__codexResult | ConvertTo-Json -Depth 12 -Compress
-    }
-    if ($null -eq $__codexJson -or $__codexJson -eq '') {
-      $__codexJson = 'null'
-    }
-    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__codexJson))
-  `
-  const { stdout, stderr } = await runPowerShell(wrappedJsonScript)
-  const base64Text = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || ''
-  const jsonText = Buffer.from(base64Text, 'base64').toString('utf8').trim()
-  if (!jsonText) {
-    throw new Error(stderr || 'PowerShell returned empty output.')
-  }
-  return JSON.parse(jsonText)
-}
-
 async function collectPrinterRuntimeState() {
   const script = `
     $ErrorActionPreference = 'Stop'
@@ -252,6 +216,12 @@ async function collectPrinterRuntimeState() {
     foreach ($wmiPrinter in (Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue)) {
       if ($wmiPrinter -and $wmiPrinter.Name) {
         $wmiPrinterMap[$wmiPrinter.Name] = $wmiPrinter
+      }
+    }
+    $pnpEntityMap = @{}
+    foreach ($pnpEntity in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+      if ($pnpEntity -and $pnpEntity.DeviceID) {
+        $pnpEntityMap[[string]$pnpEntity.DeviceID] = $pnpEntity
       }
     }
     $presentPnpMap = @{}
@@ -290,6 +260,31 @@ async function collectPrinterRuntimeState() {
         $portNameText = [string]$_.PortName
         $isUsbPort = $portNameText -match '^(?i)(USB\\d*|DOT4\\d*)'
         $wmiPnpId = if ($wmi) { [string]$wmi.PNPDeviceID } else { '' }
+        $hardwareIds = @()
+        if ($wmiPnpId -and $pnpEntityMap.ContainsKey($wmiPnpId)) {
+          $rawHardwareIds = @($pnpEntityMap[$wmiPnpId].HardwareID)
+          if ($rawHardwareIds) {
+            $hardwareIds = @($rawHardwareIds | ForEach-Object { [string]$_ } | Where-Object { $_ })
+          }
+        }
+        if (-not $hardwareIds -and $wmiPnpId) {
+          $hardwareIds = @($wmiPnpId)
+        }
+        $usbVid = ''
+        $usbPid = ''
+        $usbVidPid = ''
+        $deviceSerial = ''
+        if ($wmiPnpId -match '(?i)VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
+          $usbVid = $matches[1].ToUpper()
+          $usbPid = $matches[2].ToUpper()
+          $usbVidPid = ($usbVid + ':' + $usbPid)
+        }
+        if ($wmiPnpId -like 'USBPRINT\\*' -or $wmiPnpId -like 'USB\\VID_*') {
+          $parts = $wmiPnpId -split '\\\\'
+          if ($parts.Count -ge 3) {
+            $deviceSerial = [string]$parts[$parts.Count - 1]
+          }
+        }
         $usbDisconnected = $false
         if ($isUsbPort) {
           # USB profiles are considered disconnected by default until a live device matches.
@@ -322,6 +317,12 @@ async function collectPrinterRuntimeState() {
           Shared = $_.Shared
           ShareName = $_.ShareName
           QueueStatus = $_.QueueStatus
+          PnpDeviceId = $wmiPnpId
+          HardwareIds = $hardwareIds
+          UsbVid = $usbVid
+          UsbPid = $usbPid
+          UsbVidPid = $usbVidPid
+          DeviceSerial = $deviceSerial
           WmiWorkOffline = if ($wmi) { [bool]$wmi.WorkOffline } else { $false }
           WmiPrinterStatus = if ($wmi) { $wmi.PrinterStatus } else { $null }
           WmiAvailability = if ($wmi) { $wmi.Availability } else { $null }
@@ -342,7 +343,7 @@ async function collectPrinterRuntimeState() {
     } | ConvertTo-Json -Depth 8 -Compress
   `
 
-  const data = await runPowerShellJson(script)
+  const data = await runPowerShellJson(script, { timeoutMs: WORKER_POWERSHELL_TIMEOUT_MS })
   return {
     spooler: String(data?.spooler || 'unknown'),
     printers: normalizePrinters(data?.printers),
@@ -411,3 +412,4 @@ parentPort?.on('message', (message) => {
 })
 
 startPolling()
+
