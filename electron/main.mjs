@@ -887,12 +887,19 @@ async function backupPrinterDriver({ printerName, backupDir }) {
   }
 }
 
-async function installPrinterFromBackup({ printerName, backupDir }) {
+async function installPrinterFromBackup({
+  printerName,
+  backupDir,
+  targetPrinterName = '',
+  portHostAddressOverride = '',
+}) {
   const indexObj = await ensureBackupIndex(backupDir)
   const entry = indexObj.entries.find((item) => item.printerName === printerName)
   if (!entry) {
     throw new Error(`No backup index entry found for printer: ${printerName}`)
   }
+  const effectivePrinterName = String(targetPrinterName || '').trim() || entry.printerName
+  const effectivePortHostAddress = String(portHostAddressOverride || '').trim() || String(entry.portHostAddress || '')
 
   const backupPath = path.join(backupDir, entry.backupSubDir || '')
   let infPath = path.join(backupPath, entry.infRelativePath || '')
@@ -924,10 +931,10 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
 
   const script = `
     $ErrorActionPreference = 'Stop'
-    $printerName = ${toPsSingleQuote(entry.printerName)}
+    $printerName = ${toPsSingleQuote(effectivePrinterName)}
     $expectedDriverName = ${toPsSingleQuote(entry.driverName)}
     $preferredPort = ${toPsSingleQuote(entry.portName || '')}
-    $preferredPortHost = ${toPsSingleQuote(entry.portHostAddress || '')}
+    $preferredPortHost = ${toPsSingleQuote(effectivePortHostAddress)}
     $infPath = ${toPsSingleQuote(infPath)}
     $backupPath = ${toPsSingleQuote(backupPath)}
     $infFileName = [System.IO.Path]::GetFileName($infPath)
@@ -1107,6 +1114,17 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
       return
     }
 
+    if ($preferredPortHost) {
+      $portByHost = (Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object { $_.PrinterHostAddress -eq $preferredPortHost } | Select-Object -First 1)
+      if ($portByHost) {
+        $preferredPort = $portByHost.Name
+      } else {
+        # If user explicitly sets IP in wizard, always use host-derived port name,
+        # so we don't accidentally keep using the backup-index port identity.
+        $preferredPort = ($preferredPortHost + '_1')
+      }
+    }
+
     if ($preferredPort -and -not (Get-PrinterPort -Name $preferredPort -ErrorAction SilentlyContinue)) {
       $tcpHost = $preferredPortHost
       if (-not $tcpHost -and $preferredPort -match '^(\\d{1,3}(?:\\.\\d{1,3}){3})[_-]\\d+$') {
@@ -1158,6 +1176,37 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
     } | ConvertTo-Json -Compress
   `
 
+  return runPowerShellJson(script)
+}
+
+async function pingHost(host) {
+  const targetHost = String(host || '').trim()
+  if (!targetHost) {
+    throw new Error('Host is required.')
+  }
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $hostValue = ${toPsSingleQuote(targetHost)}
+    $reachable = $false
+    $pingOutput = ''
+    try {
+      $pinger = New-Object System.Net.NetworkInformation.Ping
+      $reply = $pinger.Send($hostValue, 1500)
+      if ($reply) {
+        $replyAddress = if ($reply.Address) { $reply.Address.ToString() } else { '' }
+        $reachable = ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success -and $replyAddress -eq $hostValue)
+        $pingOutput = "Status=$($reply.Status); Address=$replyAddress; Roundtrip=$($reply.RoundtripTime)ms"
+      } else {
+        $pingOutput = 'Ping reply is null.'
+      }
+    } catch {
+      $pingOutput = $_.Exception.Message
+    }
+    [PSCustomObject]@{
+      reachable = [bool]$reachable
+      output = [string]$pingOutput
+    } | ConvertTo-Json -Compress
+  `
   return runPowerShellJson(script)
 }
 
@@ -1594,7 +1643,16 @@ app.whenReady().then(() => {
     return installPrinterFromBackup({
       printerName: payload.printerName,
       backupDir: settings.backupDir,
+      targetPrinterName: payload.targetPrinterName || '',
+      portHostAddressOverride: payload.portHostAddressOverride || '',
     })
+  })
+  ipcMain.handle('printers:ping-host', async (_, payload) => {
+    const host = String(payload?.host || '').trim()
+    if (!host) {
+      throw new Error('Invalid host.')
+    }
+    return pingHost(host)
   })
   ipcMain.handle('printers:uninstall', async (_, payload) => {
     if (!payload?.printerName || typeof payload.printerName !== 'string') {

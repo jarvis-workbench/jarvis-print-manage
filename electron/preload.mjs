@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('eleDrive', {
   openSystemAddPrinterWizard: () => ipcRenderer.invoke('printers:open-system-add-wizard'),
   backupPrinterDriver: (payload) => ipcRenderer.invoke('printers:backup-driver', payload),
   installPrinter: (payload) => ipcRenderer.invoke('printers:install', payload),
+  pingHost: (payload) => ipcRenderer.invoke('printers:ping-host', payload),
   uninstallPrinter: (payload) => ipcRenderer.invoke('printers:uninstall', payload),
   getDriverIndex: () => ipcRenderer.invoke('drivers:index:get'),
 })

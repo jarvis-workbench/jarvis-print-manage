@@ -66,11 +66,19 @@ interface Window {
       printerName: string
       backupDir?: string
     }) => Promise<DriverBackupResult>
-    installPrinter: (payload: { printerName: string }) => Promise<{
+    installPrinter: (payload: {
+      printerName: string
+      targetPrinterName?: string
+      portHostAddressOverride?: string
+    }) => Promise<{
       status: string
       printerName: string
       driverName?: string
       portName?: string
+    }>
+    pingHost: (payload: { host: string }) => Promise<{
+      reachable: boolean
+      output?: string
     }>
     uninstallPrinter: (payload: { printerName: string }) => Promise<{
       status: string
