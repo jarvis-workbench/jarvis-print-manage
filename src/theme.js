@@ -10,6 +10,7 @@ function applyResolvedTheme(mode) {
   const resolved = resolveTheme(mode)
   document.documentElement.setAttribute('data-theme', resolved)
   document.documentElement.setAttribute('data-theme-mode', mode)
+  document.documentElement.classList.toggle('dark', resolved === 'dark')
 }
 
 export function applyThemeMode(mode = 'system') {

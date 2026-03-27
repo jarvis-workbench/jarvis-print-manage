@@ -25,9 +25,29 @@ interface InstalledPrinter {
 interface DriverBackupResult {
   printerName: string
   driverName: string
+  driverVersion?: string
+  manufacturer?: string
+  environment?: string
+  portName?: string
+  infRelativePath?: string
+  backupAt?: string
   infPath?: string
   backupDir: string
   method: string
+}
+
+interface DriverIndexEntry {
+  printerName: string
+  driverName: string
+  driverVersion: string
+  manufacturer: string
+  infRelativePath: string
+  backupSubDir: string
+  backupAt: string
+  portName: string
+  portHostAddress: string
+  portNumber: string
+  environment: string
 }
 
 interface Window {
@@ -42,5 +62,31 @@ interface Window {
       printerName: string
       backupDir?: string
     }) => Promise<DriverBackupResult>
+    installPrinter: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      driverName?: string
+      portName?: string
+    }>
+    uninstallPrinter: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      driverName?: string
+      driverRemoved?: boolean
+      driverRemoveError?: string
+      portName?: string
+      portRemoved?: boolean
+      portRemoveError?: string
+      fileRepoResidues?: string[]
+      spoolResidues?: string[]
+    }>
+    getDriverIndex: () => Promise<{
+      backupDir: string
+      index: {
+        version: number
+        updatedAt: string
+        entries: DriverIndexEntry[]
+      }
+    }>
   }
 }

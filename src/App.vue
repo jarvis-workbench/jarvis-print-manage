@@ -1,20 +1,48 @@
 ﻿<script setup>
-import { RouterLink, RouterView } from 'vue-router'
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Home, Printer, SettingConfig } from '@icon-park/vue-next'
+
+const route = useRoute()
+const router = useRouter()
+
+const activePath = computed(() => route.path)
+
+function handleMenuSelect(path) {
+  if (path !== route.path) router.push(path)
+}
 </script>
 
 <template>
-  <main class="shell">
-    <aside class="sidebar">
-      <RouterLink to="/" class="brand">虹色打印机助手</RouterLink>
-      <p class="brand-subtitle">Printer Driver Toolkit</p>
-      <nav class="nav">
-        <RouterLink to="/" class="nav-link">概览</RouterLink>
-        <RouterLink to="/printers" class="nav-link">打印机管理</RouterLink>
-        <RouterLink to="/settings" class="nav-link">系统设置</RouterLink>
-      </nav>
-    </aside>
-    <section class="content-wrap">
-      <RouterView />
-    </section>
-  </main>
+  <el-container class="shell">
+    <el-aside class="sidebar" width="190px">
+      <div class="brand">虹色打印机助手</div>
+      <div class="brand-subtitle">Printer Driver Toolkit</div>
+
+      <el-menu class="nav-menu" :default-active="activePath" @select="handleMenuSelect">
+        <el-menu-item index="/">
+          <div class="nav-item-content">
+            <span class="menu-icon"><home theme="outline" size="16" /></span>
+            <span class="menu-label">概览</span>
+          </div>
+        </el-menu-item>
+        <el-menu-item index="/printers">
+          <div class="nav-item-content">
+            <span class="menu-icon"><printer theme="outline" size="16" /></span>
+            <span class="menu-label">打印机管理</span>
+          </div>
+        </el-menu-item>
+        <el-menu-item index="/settings">
+          <div class="nav-item-content">
+            <span class="menu-icon"><setting-config theme="outline" size="16" /></span>
+            <span class="menu-label">系统设置</span>
+          </div>
+        </el-menu-item>
+      </el-menu>
+    </el-aside>
+
+    <el-main class="content-wrap">
+      <router-view />
+    </el-main>
+  </el-container>
 </template>

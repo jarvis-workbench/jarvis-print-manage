@@ -1,5 +1,7 @@
 ﻿<script setup>
 import { onMounted, ref } from 'vue'
+import { Theme, FolderOpen } from '@icon-park/vue-next'
+import { ElMessage } from 'element-plus'
 import { applyThemeMode, bindSystemTheme } from '../theme'
 
 const loading = ref(false)
@@ -34,7 +36,7 @@ async function saveThemeMode() {
     themeMode.value = saved.themeMode
     applyThemeMode(themeMode.value)
     bindSystemTheme(themeMode.value)
-    window.alert('配置保存成功')
+    ElMessage.success('配置保存成功')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -44,14 +46,14 @@ async function saveThemeMode() {
 
 async function chooseBackupDirByInput() {
   if (!window.eleDrive?.chooseBackupDir || !window.eleDrive?.setBackupDir) return
-  saving.value = true
   error.value = ''
   try {
     const selected = await window.eleDrive.chooseBackupDir()
     if (!selected) return
+    saving.value = true
     const saved = await window.eleDrive.setBackupDir(selected)
     backupDir.value = saved.backupDir
-    window.alert('配置保存成功')
+    ElMessage.success('配置保存成功')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -63,37 +65,53 @@ onMounted(loadSettings)
 </script>
 
 <template>
-  <section class="panel">
-    <div class="panel-head">
-      <h1>系统设置</h1>
-      <span class="badge badge-soft">自动保存</span>
-    </div>
-    <p class="hint">所有配置项更改后将自动保存，无需手动点击保存按钮。</p>
+  <el-card class="panel-card" shadow="never">
+    <template #header>
+      <div class="panel-title-wrap">
+        <h1>系统设置</h1>
+        <el-tag type="warning">自动保存</el-tag>
+      </div>
+    </template>
 
-    <div v-if="loading" class="state-text">正在加载设置...</div>
-
-    <div v-else class="form-grid">
-      <label class="field-label" for="themeMode">主题模式</label>
-      <select id="themeMode" v-model="themeMode" class="text-input" :disabled="saving" @change="saveThemeMode">
-        <option value="light">亮</option>
-        <option value="dark">暗</option>
-        <option value="system">跟随系统</option>
-      </select>
-
-      <label class="field-label" for="backupDir">备份驱动目录</label>
-      <input
-        id="backupDir"
-        v-model="backupDir"
-        class="text-input readonly-picker"
-        type="text"
-        placeholder="点击选择目录"
-        readonly
-        :disabled="saving"
-        @click="chooseBackupDirByInput"
-      />
+    <div class="settings-hint settings-hint-top">
+      <theme theme="outline" size="16" />
+      <span>所有配置项更改后会立即保存。</span>
     </div>
 
-    <p v-if="saving" class="state-text">正在保存配置...</p>
-    <p v-if="error" class="error-text">{{ error }}</p>
-  </section>
+    <el-skeleton v-if="loading" :rows="4" animated />
+
+    <el-form v-else label-position="top" class="settings-form">
+      <el-form-item label="主题模式">
+        <el-select v-model="themeMode" :disabled="saving" @change="saveThemeMode">
+          <el-option label="亮" value="light" />
+          <el-option label="暗" value="dark" />
+          <el-option label="跟随系统" value="system" />
+        </el-select>
+      </el-form-item>
+
+      <el-form-item label="驱动备份目录">
+        <el-input
+          v-model="backupDir"
+          readonly
+          :disabled="saving"
+          placeholder="点击输入框选择目录"
+          @click="chooseBackupDirByInput"
+        >
+          <template #prefix>
+            <folder-open theme="outline" size="15" />
+          </template>
+        </el-input>
+      </el-form-item>
+    </el-form>
+
+    <el-alert
+      v-if="saving"
+      title="正在保存配置..."
+      type="info"
+      :closable="false"
+      show-icon
+      class="status-alert"
+    />
+    <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="status-alert" />
+  </el-card>
 </template>
