@@ -1,9 +1,9 @@
 ﻿<script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { storeToRefs } from 'pinia'
 import { RefreshOne, Download, Upload, Delete } from '@icon-park/vue-next'
 import { ElMessage, ElMessageBox } from 'element-plus'
-
-const USB_PORT_POLL_INTERVAL_MS = 1500
+import { useRuntimeStore } from '../stores/runtime'
 
 const loading = ref(false)
 const savingAction = ref('')
@@ -23,66 +23,12 @@ const addPrinterDialogVisible = ref(false)
 const error = ref('')
 const message = ref('')
 
-const installedPrinters = ref([])
-const indexEntries = ref([])
-const backupDir = ref('')
+const runtimeStore = useRuntimeStore()
+const { settings, PrinterServerManage } = storeToRefs(runtimeStore)
 const waitingUsbReconnectNames = ref(new Set())
+let removePrinterStateUpdatedListener = null
 
-let usbPortWatcherTimer = null
-let usbPortWatcherRunning = false
-let usbPortWatcherInitialized = false
-let knownUsbPortSet = new Set()
-let knownPrinterProbeSignature = ''
-
-const rows = computed(() => {
-  const map = new Map()
-
-  for (const item of installedPrinters.value) {
-      map.set(item.name, {
-        printerName: item.name,
-        installed: true,
-        indexed: false,
-        portName: item.portName || '',
-        portHostAddress: '',
-        driverName: item.driverName || '',
-        manufacturer: item.driver?.manufacturer || '',
-        driverVersion: item.driver?.driverVersion || '',
-        systemInfPath: item.driver?.infPath || '',
-        infRelativePath: '',
-      })
-  }
-
-  for (const entry of indexEntries.value) {
-    const existing = map.get(entry.printerName)
-    if (existing) {
-      map.set(entry.printerName, {
-        ...existing,
-        indexed: true,
-        driverName: existing.driverName || entry.driverName || '',
-        portHostAddress: existing.portHostAddress || entry.portHostAddress || '',
-        manufacturer: existing.manufacturer || entry.manufacturer || '',
-        driverVersion: existing.driverVersion || entry.driverVersion || '',
-        systemInfPath: existing.systemInfPath || '',
-        infRelativePath: entry.infRelativePath || '',
-      })
-    } else {
-      map.set(entry.printerName, {
-        printerName: entry.printerName,
-        installed: false,
-        indexed: true,
-        portName: entry.portName || '',
-        portHostAddress: entry.portHostAddress || '',
-        driverName: entry.driverName || '',
-        manufacturer: entry.manufacturer || '',
-        driverVersion: entry.driverVersion || '',
-        systemInfPath: '',
-        infRelativePath: entry.infRelativePath || '',
-      })
-    }
-  }
-
-  return [...map.values()].sort((a, b) => a.printerName.localeCompare(b.printerName))
-})
+const rows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
 
 const totalPrinters = computed(() => rows.value.length)
 const installWizardNeedsIpStep = computed(() => isIpPortProfile(installWizardRow.value))
@@ -140,25 +86,40 @@ function markWaitingUsbReconnect(printerName, waiting) {
   waitingUsbReconnectNames.value = next
 }
 
-function reconcileWaitingUsbReconnectState(installed, indexed) {
+function reconcileWaitingUsbReconnectState(printers) {
   if (!waitingUsbReconnectNames.value.size) return
-  const installedSet = new Set((Array.isArray(installed) ? installed : []).map((item) => normalizePrinterKey(item?.name)))
-  const indexedSet = new Set((Array.isArray(indexed) ? indexed : []).map((item) => normalizePrinterKey(item?.printerName)))
+  const printerList = Array.isArray(printers) ? printers : []
+  const installedList = printerList.filter((item) => item?.installed)
+  const backupList = printerList.filter((item) => item?.backup)
+  const installedSet = new Set(installedList.map((item) => normalizePrinterKey(item?.printerName)))
+  const installedDriverSet = new Set(
+    installedList
+      .map((item) => String(item?.driverName || '').trim().toLowerCase())
+      .filter(Boolean),
+  )
+  const backupMap = new Map(
+    backupList
+      .map((item) => [normalizePrinterKey(item?.printerName), item])
+      .filter(([key]) => Boolean(key)),
+  )
   const next = new Set()
   for (const key of waitingUsbReconnectNames.value) {
-    if (indexedSet.has(key) && !installedSet.has(key)) {
-      next.add(key)
-    }
+    const backupItem = backupMap.get(key)
+    if (!backupItem) continue
+    if (installedSet.has(key)) continue
+    const backupDriverName = String(backupItem?.driverName || '').trim().toLowerCase()
+    if (backupDriverName && installedDriverSet.has(backupDriverName)) continue
+    next.add(key)
   }
   waitingUsbReconnectNames.value = next
 }
 
 function canBackup(row) {
-  return row.installed && !row.indexed
+  return row.installed && !row.backup
 }
 
 function canInstall(row) {
-  return !row.installed && row.indexed && !hasWaitingUsbReconnect(row)
+  return !row.installed && row.backup && !hasWaitingUsbReconnect(row)
 }
 
 function canUninstall(row) {
@@ -167,12 +128,12 @@ function canUninstall(row) {
 
 function driverStatusType(row) {
   if (!row?.installed) return 'info'
-  return row?.indexed ? 'success' : 'warning'
+  return row?.backup ? 'success' : 'warning'
 }
 
 function driverStatusText(row) {
   if (!row?.installed) return '未安装'
-  return row?.indexed ? '已备份' : '未备份'
+  return row?.backup ? '已备份' : '未备份'
 }
 
 function infDisplayText(row) {
@@ -181,40 +142,44 @@ function infDisplayText(row) {
 }
 
 function displayPortName(row) {
-  if (!row?.installed && row?.indexed && /^USB/i.test(String(row?.portName || ''))) {
+  if (!row?.installed && row?.backup && /^USB/i.test(String(row?.portName || ''))) {
     return 'USB'
   }
   return row?.portName || '-'
 }
 
 function displayPortLabel(row) {
-  if (!row?.installed && row?.indexed) {
+  if (!row?.installed && row?.backup) {
     return '驱动备份端口'
   }
   return '端口'
 }
 
-function buildPrinterProbeSignature(list) {
-  const rows = Array.isArray(list) ? list : []
-  return rows
-    .map((item) => {
-      const name = String(item?.name || '')
-      const driverName = String(item?.driverName || '')
-      const portName = String(item?.portName || '')
-      const printerStatus = String(item?.printerStatus || '')
-      const workOffline = item?.workOffline ? '1' : '0'
-      return `${name}|${driverName}|${portName}|${printerStatus}|${workOffline}`
-    })
-    .sort()
-    .join('||')
+function printerAvailabilityText(row) {
+  if (!row?.installed) return '未安装'
+  const availability = String(row?.availability || row?.runtimeAvailability || '').toLowerCase()
+  const statusText = String(row?.printerStatus ?? '').toLowerCase()
+  const statusNum = Number(row?.printerStatus)
+  if (availability === 'offline') return '脱机'
+  if (row?.workOffline) return '脱机'
+  if (Number.isFinite(statusNum) && (statusNum === 7 || statusNum === 8)) return '脱机'
+  if (
+    statusText.includes('offline') ||
+    statusText.includes('脱机') ||
+    statusText.includes('离线') ||
+    statusText.includes('離線')
+  ) {
+    return '脱机'
+  }
+  if (availability === 'ready') return '就绪'
+  return '就绪'
 }
 
-function isSameSet(a, b) {
-  if (a.size !== b.size) return false
-  for (const item of a) {
-    if (!b.has(item)) return false
-  }
-  return true
+function printerAvailabilityType(row) {
+  const status = printerAvailabilityText(row)
+  if (status === '就绪') return 'success'
+  if (status === '脱机') return 'danger'
+  return 'info'
 }
 
 async function loadPrinters(options = {}) {
@@ -229,12 +194,12 @@ async function loadPrinters(options = {}) {
       window.eleDrive.listInstalledPrinters(),
       window.eleDrive.getDriverIndex(),
     ])
-
-    installedPrinters.value = installed
-    indexEntries.value = indexPayload?.index?.entries || []
-    backupDir.value = indexPayload?.backupDir || ''
-    reconcileWaitingUsbReconnectState(installedPrinters.value, indexEntries.value)
-    knownPrinterProbeSignature = buildPrinterProbeSignature(installed)
+    runtimeStore.setPrinterSnapshot({
+      installedPrinters: installed,
+      driverIndexEntries: indexPayload?.index?.entries || [],
+      backupDir: indexPayload?.backupDir || '',
+    })
+    reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
   } catch (err) {
     if (!silent) {
       error.value = err instanceof Error ? err.message : String(err)
@@ -246,81 +211,39 @@ async function loadPrinters(options = {}) {
   }
 }
 
-function toUsbPortSet(rawPorts) {
-  const list = Array.isArray(rawPorts) ? rawPorts : []
-  return new Set(
-    list
-      .map((item) => String(item || '').trim().toUpperCase())
-      .filter((name) => /^USB\d+$/.test(name)),
-  )
+async function handlePrinterStateUpdated(payload) {
+  if (!payload || savingAction.value) return
+  runtimeStore.setPrinterRuntimeState(payload)
+  const changes = payload?.changes || {}
+  const hasChanges = ['addedPrinters', 'removedPrinters', 'changedPrinters', 'addedPorts', 'removedPorts']
+    .some((key) => Array.isArray(changes[key]) && changes[key].length > 0)
+  if (!hasChanges) return
+  await loadPrinters({ silent: true })
 }
 
-async function pollUsbPortsAndRefresh() {
-  if (!window.eleDrive?.listUsbPrinterPorts || !window.eleDrive?.listInstalledPrinters) return
-  if (savingAction.value) return
-  if (usbPortWatcherRunning) return
-  usbPortWatcherRunning = true
-  try {
-    const [rawUsbPorts, installed] = await Promise.all([
-      window.eleDrive.listUsbPrinterPorts(),
-      window.eleDrive.listInstalledPrinters(),
-    ])
-    const nextSet = toUsbPortSet(rawUsbPorts)
-    const nextSignature = buildPrinterProbeSignature(installed)
-
-    if (!usbPortWatcherInitialized) {
-      usbPortWatcherInitialized = true
-      knownUsbPortSet = nextSet
-      knownPrinterProbeSignature = nextSignature
-      return
-    }
-
-    const usbChanged = !isSameSet(knownUsbPortSet, nextSet)
-    const printerChanged = nextSignature !== knownPrinterProbeSignature
-
-    knownUsbPortSet = nextSet
-    knownPrinterProbeSignature = nextSignature
-
-    if (usbChanged || printerChanged) {
-      await loadPrinters({ silent: true })
-    }
-  } catch {
-    // ignore watcher polling errors
-  } finally {
-    usbPortWatcherRunning = false
+function subscribePrinterRuntimeState() {
+  if (!window.eleDrive?.onPrinterStateUpdated) return
+  if (typeof removePrinterStateUpdatedListener === 'function') {
+    removePrinterStateUpdatedListener()
   }
+  removePrinterStateUpdatedListener = window.eleDrive.onPrinterStateUpdated((payload) => {
+    void handlePrinterStateUpdated(payload)
+  })
 }
 
-function startUsbPortWatcher() {
-  if (!window.eleDrive?.listUsbPrinterPorts) return
-  stopUsbPortWatcher()
-  usbPortWatcherInitialized = false
-  knownUsbPortSet = new Set()
-  knownPrinterProbeSignature = ''
-  void pollUsbPortsAndRefresh()
-  usbPortWatcherTimer = setInterval(() => {
-    void pollUsbPortsAndRefresh()
-  }, USB_PORT_POLL_INTERVAL_MS)
-}
-
-function stopUsbPortWatcher() {
-  if (usbPortWatcherTimer) {
-    clearInterval(usbPortWatcherTimer)
-    usbPortWatcherTimer = null
+function unsubscribePrinterRuntimeState() {
+  if (typeof removePrinterStateUpdatedListener === 'function') {
+    removePrinterStateUpdatedListener()
   }
+  removePrinterStateUpdatedListener = null
 }
 
 function applyUninstallOptimistically(row) {
   const printerName = row?.printerName
-  const key = normalizePrinterKey(printerName)
-  installedPrinters.value = installedPrinters.value.filter(
-    (item) => normalizePrinterKey(item?.name) !== key,
-  )
-  if (!row?.indexed) {
-    indexEntries.value = indexEntries.value.filter(
-      (item) => normalizePrinterKey(item?.printerName) !== key,
-    )
-  }
+  runtimeStore.applyOptimisticUninstall({
+    printerName,
+    keepBackup: Boolean(row?.backup),
+  })
   markWaitingUsbReconnect(printerName, false)
 }
 
@@ -365,7 +288,7 @@ function closeInstallWizard(force = false) {
 function isDuplicatePrinterName(name) {
   const key = normalizePrinterKey(name)
   if (!key) return false
-  return installedPrinters.value.some((item) => normalizePrinterKey(item?.name) === key)
+  return rows.value.some((item) => item?.installed && normalizePrinterKey(item?.printerName) === key)
 }
 
 async function runInstallTask(row, installPayload) {
@@ -380,7 +303,9 @@ async function runInstallTask(row, installPayload) {
       await loadPrinters({ silent: true })
       refreshedInTry = true
       const targetDriverName = String(result.driverName || row.driverName || '').toLowerCase()
-      const occupied = !!targetDriverName && installedPrinters.value.some((printer) => String(printer.driverName || '').toLowerCase() === targetDriverName)
+      const occupied = !!targetDriverName && rows.value.some(
+        (printer) => printer?.installed && String(printer.driverName || '').toLowerCase() === targetDriverName,
+      )
       if (occupied) {
         markWaitingUsbReconnect(row.printerName, false)
         ElMessage.success('驱动已安装')
@@ -594,11 +519,19 @@ async function openSystemDriverInstall() {
 
 onMounted(async () => {
   await loadPrinters()
-  startUsbPortWatcher()
+  subscribePrinterRuntimeState()
+  if (window.eleDrive?.getPrinterRuntimeState) {
+    try {
+      const state = await window.eleDrive.getPrinterRuntimeState()
+      await handlePrinterStateUpdated(state)
+    } catch {
+      // ignore bootstrap state errors
+    }
+  }
 })
 
 onUnmounted(() => {
-  stopUsbPortWatcher()
+  unsubscribePrinterRuntimeState()
 })
 </script>
 
@@ -622,7 +555,7 @@ onUnmounted(() => {
       </div>
     </template>
 
-    <p class="hint">当前打印机驱动备份目录：{{ backupDir || '-' }}</p>
+    <p class="hint">当前打印机驱动备份目录：{{ settings.backupDir || '-' }}</p>
 
     <el-alert v-if="message" :title="message" type="success" show-icon :closable="false" class="status-alert" />
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="status-alert" />
@@ -657,6 +590,11 @@ onUnmounted(() => {
               <div class="cell-title" :title="row.printerName">{{ row.printerName }}</div>
               <div class="cell-sub" :title="`${displayPortLabel(row)}：${displayPortName(row)}`">
                 {{ displayPortLabel(row) }}：{{ displayPortName(row) }}
+              </div>
+              <div class="cell-sub">
+                <el-tag size="small" :type="printerAvailabilityType(row)" effect="plain">
+                  {{ printerAvailabilityText(row) }}
+                </el-tag>
               </div>
             </div>
           </div>

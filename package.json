@@ -36,7 +36,14 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "!electron/resource{,/**}",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/resource",
+        "to": "."
+      }
     ],
     "directories": {
       "output": "release"

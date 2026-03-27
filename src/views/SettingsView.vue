@@ -3,12 +3,14 @@ import { onMounted, ref } from 'vue'
 import { Theme, FolderOpen } from '@icon-park/vue-next'
 import { ElMessage } from 'element-plus'
 import { applyThemeMode, bindSystemTheme } from '../theme'
+import { useRuntimeStore } from '../stores/runtime'
 
 const loading = ref(false)
 const saving = ref(false)
 const backupDir = ref('')
 const themeMode = ref('system')
 const error = ref('')
+const runtimeStore = useRuntimeStore()
 
 async function loadSettings() {
   if (!window.eleDrive?.getSettings) return
@@ -18,6 +20,7 @@ async function loadSettings() {
     const settings = await window.eleDrive.getSettings()
     backupDir.value = settings.backupDir || ''
     themeMode.value = settings.themeMode || 'system'
+    runtimeStore.setSettings(settings || {})
     applyThemeMode(themeMode.value)
     bindSystemTheme(themeMode.value)
   } catch (err) {
@@ -34,6 +37,7 @@ async function saveThemeMode() {
   try {
     const saved = await window.eleDrive.setThemeMode(themeMode.value)
     themeMode.value = saved.themeMode
+    runtimeStore.setSettings(saved || {})
     applyThemeMode(themeMode.value)
     bindSystemTheme(themeMode.value)
     ElMessage.success('配置保存成功')
@@ -53,6 +57,7 @@ async function chooseBackupDirByInput() {
     saving.value = true
     const saved = await window.eleDrive.setBackupDir(selected)
     backupDir.value = saved.backupDir
+    runtimeStore.setSettings(saved || {})
     ElMessage.success('配置保存成功')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)

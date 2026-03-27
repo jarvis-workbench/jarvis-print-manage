@@ -5,6 +5,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { Worker } from 'node:worker_threads'
 import { loadPsScript } from './config/script/ps/index.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -16,14 +17,102 @@ const THEME_MODES = new Set(['light', 'dark', 'system'])
 const INDEX_FILE_NAME = 'driver-index.json'
 const BACKUP_META_FILE_NAME = 'driver-backup.json'
 const TRAY_ICON_NAME = 'tray.png'
+const PRINTER_STATE_POLL_INTERVAL_MS = 2000
+const SYSTEM_SETTINGS_RELATIVE_PATH = path.join('config', 'system.json')
 
 let mainWindow = null
 let tray = null
 let appIsQuitting = false
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
+let printerStateWorker = null
+let printerRuntimeState = {
+  seq: 0,
+  changedAt: '',
+  spooler: 'unknown',
+  printers: [],
+  ports: [],
+  changes: {
+    addedPrinters: [],
+    removedPrinters: [],
+    changedPrinters: [],
+    addedPorts: [],
+    removedPorts: [],
+  },
+}
+
+function broadcastPrinterState() {
+  const payload = {
+    ...printerRuntimeState,
+  }
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue
+    win.webContents.send('printers:state-updated', payload)
+  }
+}
+
+function requestPrinterStateRefresh() {
+  if (!printerStateWorker) return
+  try {
+    printerStateWorker.postMessage({ type: 'refresh' })
+  } catch {}
+}
+
+function stopPrinterStateWorker() {
+  if (!printerStateWorker) return
+  try {
+    printerStateWorker.postMessage({ type: 'stop' })
+  } catch {}
+  try {
+    printerStateWorker.terminate()
+  } catch {}
+  printerStateWorker = null
+}
+
+function startPrinterStateWorker() {
+  if (printerStateWorker || appIsQuitting) return
+  const workerPath = path.join(__dirname, 'printer-state-worker.mjs')
+  printerStateWorker = new Worker(workerPath, {
+    workerData: {
+      pollIntervalMs: PRINTER_STATE_POLL_INTERVAL_MS,
+    },
+  })
+
+  printerStateWorker.on('message', (message) => {
+    const type = String(message?.type || '')
+    if (type === 'snapshot') {
+      printerRuntimeState = {
+        ...printerRuntimeState,
+        ...message.payload,
+      }
+      broadcastPrinterState()
+      return
+    }
+    if (type === 'error') {
+      const msg = message?.payload?.message || 'unknown error'
+      console.warn(`[printer-state-worker] ${msg}`)
+    }
+  })
+
+  printerStateWorker.on('error', (error) => {
+    console.warn(`[printer-state-worker] crash: ${error?.message || error}`)
+  })
+
+  printerStateWorker.on('exit', (code) => {
+    printerStateWorker = null
+    if (!appIsQuitting && code !== 0) {
+      setTimeout(() => {
+        startPrinterStateWorker()
+      }, 1200)
+    }
+  })
+}
+
+function getResourceRootPath() {
+  return app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resource')
+}
 
 function getSettingsFilePath() {
-  return path.join(app.getPath('userData'), 'settings.json')
+  return path.join(getResourceRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
 }
 
 function getIndexFilePath(backupDir) {
@@ -742,6 +831,7 @@ if (!gotSingleInstanceLock) {
 
     ipcMain.handle('printers:list-installed', async () => getInstalledPrinters())
     ipcMain.handle('printers:list-usb-ports', async () => listUsbPrinterPorts())
+    ipcMain.handle('printers:state:get', async () => ({ ...printerRuntimeState }))
     ipcMain.handle('printers:open-system-add-wizard', async () => openSystemAddPrinterWizard())
     ipcMain.handle('printers:backup-driver', async (_, payload) => {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
@@ -758,12 +848,14 @@ if (!gotSingleInstanceLock) {
         throw new Error('Invalid printer name.')
       }
       const settings = await readSettings()
-      return installPrinterFromBackup({
+      const result = await installPrinterFromBackup({
         printerName: payload.printerName,
         backupDir: settings.backupDir,
         targetPrinterName: payload.targetPrinterName || '',
         portHostAddressOverride: payload.portHostAddressOverride || '',
       })
+      requestPrinterStateRefresh()
+      return result
     })
     ipcMain.handle('printers:ping-host', async (_, payload) => {
       const host = String(payload?.host || '').trim()
@@ -776,9 +868,11 @@ if (!gotSingleInstanceLock) {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
         throw new Error('Invalid printer name.')
       }
-      return uninstallPrinter({
+      const result = await uninstallPrinter({
         printerName: payload.printerName,
       })
+      requestPrinterStateRefresh()
+      return result
     })
 
     ipcMain.handle('drivers:index:get', async () => {
@@ -793,6 +887,7 @@ if (!gotSingleInstanceLock) {
 
     createMainWindow()
     createTray()
+    startPrinterStateWorker()
 
     app.on('activate', () => {
       showMainWindow('/')
@@ -801,6 +896,7 @@ if (!gotSingleInstanceLock) {
 
   app.on('before-quit', () => {
     appIsQuitting = true
+    stopPrinterStateWorker()
   })
 
   app.on('window-all-closed', () => {

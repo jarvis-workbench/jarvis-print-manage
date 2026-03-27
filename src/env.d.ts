@@ -52,6 +52,38 @@ interface DriverIndexEntry {
   environment: string
 }
 
+interface PrinterRuntimeItem {
+  name: string
+  driverName: string
+  portName: string
+  printerStatus?: string | number
+  workOffline?: boolean
+  shared?: boolean
+  shareName?: string
+  availability?: 'ready' | 'offline'
+}
+
+interface PrinterPortRuntimeItem {
+  name: string
+  printerHostAddress?: string
+  portNumber?: string
+}
+
+interface PrinterRuntimeState {
+  seq: number
+  changedAt: string
+  spooler: string
+  printers: PrinterRuntimeItem[]
+  ports: PrinterPortRuntimeItem[]
+  changes?: {
+    addedPrinters?: string[]
+    removedPrinters?: string[]
+    changedPrinters?: string[]
+    addedPorts?: string[]
+    removedPorts?: string[]
+  }
+}
+
 interface Window {
   eleDrive?: {
     getAppVersion: () => Promise<string>
@@ -61,6 +93,7 @@ interface Window {
     chooseBackupDir: () => Promise<string | null>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
     listUsbPrinterPorts: () => Promise<string[]>
+    getPrinterRuntimeState: () => Promise<PrinterRuntimeState>
     openSystemAddPrinterWizard: () => Promise<{ status: string }>
     backupPrinterDriver: (payload: {
       printerName: string
@@ -101,5 +134,6 @@ interface Window {
       }
     }>
     onTrayNavigate: (handler: (payload: { path?: string } | null) => void) => () => void
+    onPrinterStateUpdated: (handler: (payload: PrinterRuntimeState | null) => void) => () => void
   }
 }
