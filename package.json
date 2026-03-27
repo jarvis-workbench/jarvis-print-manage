@@ -16,6 +16,7 @@
   "dependencies": {
     "@icon-park/vue-next": "^1.4.2",
     "element-plus": "^2.13.6",
+    "pinia": "^3.0.4",
     "vue": "^3.5.30",
     "vue-router": "^4.6.4"
   },
@@ -26,6 +27,7 @@
     "electron": "^41.0.4",
     "electron-builder": "^26.8.1",
     "vite": "^8.0.1",
+    "vite-plugin-vue-devtools": "^8.1.1",
     "wait-on": "^9.0.4"
   },
   "build": {

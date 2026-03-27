@@ -1,0 +1,23 @@
+
+    $ErrorActionPreference = 'Stop'
+    $hostValue = {{HOST_VALUE}}
+    $reachable = $false
+    $pingOutput = ''
+    try {
+      $pinger = New-Object System.Net.NetworkInformation.Ping
+      $reply = $pinger.Send($hostValue, 1500)
+      if ($reply) {
+        $replyAddress = if ($reply.Address) { $reply.Address.ToString() } else { '' }
+        $reachable = ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success -and $replyAddress -eq $hostValue)
+        $pingOutput = "Status=$($reply.Status); Address=$replyAddress; Roundtrip=$($reply.RoundtripTime)ms"
+      } else {
+        $pingOutput = 'Ping reply is null.'
+      }
+    } catch {
+      $pingOutput = $_.Exception.Message
+    }
+    [PSCustomObject]@{
+      reachable = [bool]$reachable
+      output = [string]$pingOutput
+    } | ConvertTo-Json -Compress
+  

@@ -1,0 +1,275 @@
+
+    $ErrorActionPreference = 'Stop'
+    $printerName = {{PRINTER_NAME}}
+    $expectedDriverName = {{EXPECTED_DRIVER_NAME}}
+	    $preferredPort = {{PREFERRED_PORT}}
+	    $preferredPortHost = {{PREFERRED_PORT_HOST}}
+	    $infPath = {{INF_PATH}}
+	    $backupPath = {{BACKUP_PATH}}
+	    $infFileName = [System.IO.Path]::GetFileName($infPath)
+	    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+	    if ($spooler -and $spooler.Status -ne 'Running') {
+	      try {
+	        Start-Service -Name spooler -ErrorAction Stop
+	        Start-Sleep -Milliseconds 700
+	      } catch {}
+	    }
+	    $beforeDrivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+
+    function Ensure-InfMappedAliases {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+      $infDir = Split-Path -Path $InfPath -Parent
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+        if ($line -match '^(?i)([^\\/:*?"<>|,=\\s]+\\.[A-Za-z0-9_]{1,5})\\s*,\\s*([^\\/:*?"<>|,=\\s]+\\.[A-Za-z0-9_]{1,5})\\s*$') {
+          $destName = $matches[1]
+          $sourceName = $matches[2]
+          $destPath = Join-Path $infDir $destName
+          $sourcePath = Join-Path $infDir $sourceName
+          if (-not (Test-Path $destPath) -and (Test-Path $sourcePath)) {
+            try {
+              Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force
+            } catch {}
+          }
+        }
+      }
+    }
+
+    function Ensure-InfSourceLayout {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+
+      $infDir = Split-Path -Path $InfPath -Parent
+      $diskMap = @{}
+      $fileMap = @()
+      $currentSection = ''
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+
+        if ($line -match '^\\[(.+)\\]$') {
+          $currentSection = $matches[1].Trim().ToLower()
+          continue
+        }
+
+        if ($currentSection -eq 'sourcedisksnames' -or $currentSection -eq 'sourcedisksnames.amd64') {
+          if ($line -match '^\\s*(\\d+)\\s*=\\s*[^,]*,[^,]*,[^,]*,\\s*"?(.*?)"?\\s*$') {
+            $diskId = $matches[1]
+            $diskPath = $matches[2].Trim()
+            $diskMap[$diskId] = $diskPath
+          }
+          continue
+        }
+
+        if ($currentSection -match '^sourcedisksfiles(\\.|$)') {
+          if ($line -match '^\\s*([^=,;\\s]+)\\s*=\\s*(\\d+)') {
+            $fileName = $matches[1].Trim()
+            $diskId = $matches[2].Trim()
+            $fileMap += [PSCustomObject]@{
+              fileName = $fileName
+              diskId = $diskId
+            }
+          }
+        }
+      }
+
+      foreach ($item in $fileMap) {
+        $fileName = $item.fileName
+        $diskId = $item.diskId
+        $subPath = ''
+        if ($diskMap.ContainsKey($diskId)) {
+          $subPath = [string]$diskMap[$diskId]
+        }
+        if (-not $subPath) { continue }
+
+        $sourceRootPath = Join-Path $infDir $fileName
+        $targetPath = Join-Path $infDir (Join-Path $subPath $fileName)
+        if ((-not (Test-Path $targetPath)) -and (Test-Path $sourceRootPath)) {
+          $targetDir = Split-Path -Path $targetPath -Parent
+          if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          }
+          try {
+            Copy-Item -LiteralPath $sourceRootPath -Destination $targetPath -Force
+          } catch {}
+        }
+      }
+    }
+
+    $existing = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
+    if ($existing) {
+      [PSCustomObject]@{ status = 'already-installed'; printerName = $printerName } | ConvertTo-Json -Compress
+      return
+    }
+
+    $driver = $null
+    $pnpOutput = ''
+
+    if ($infPath -and (Test-Path $infPath)) {
+      $candidateInfs = @()
+      if (Test-Path $backupPath) {
+        $candidateInfs += @(Get-ChildItem -Path $backupPath -Filter *.inf -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+      }
+      if ($infPath -and (Test-Path $infPath) -and ($candidateInfs -notcontains $infPath)) {
+        $candidateInfs = @($infPath) + $candidateInfs
+      }
+      foreach ($candidateInf in ($candidateInfs | Select-Object -Unique)) {
+        Ensure-InfMappedAliases -InfPath $candidateInf
+        Ensure-InfSourceLayout -InfPath $candidateInf
+      }
+      $pnpOutput = (& pnputil.exe /add-driver $infPath /install 2>&1 | Out-String)
+      if ($LASTEXITCODE -ne 0) {
+        $pnpFallbackOutput = (& pnputil.exe /add-driver (Join-Path $backupPath '*.inf') /subdirs /install 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+          throw "Failed to install driver package. pnputil direct output: $pnpOutput; fallback output: $pnpFallbackOutput"
+        }
+        $pnpOutput = $pnpOutput + [Environment]::NewLine + $pnpFallbackOutput
+      }
+      $publishedInf = ''
+      if ($pnpOutput -match '(?im)Published Name\\s*:\\s*(oem\\d+\\.inf)') {
+        $publishedInf = $matches[1]
+      }
+
+      $driver = Get-PrinterDriver -Name $expectedDriverName -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $driver) {
+        $driver = Get-PrinterDriver | Where-Object {
+          $_.InfPath -and ([System.IO.Path]::GetFileName($_.InfPath).ToLower() -eq $infFileName.ToLower())
+        } | Select-Object -First 1
+      }
+	      if (-not $driver -and $publishedInf -and $expectedDriverName) {
+	        $publishedInfPath = Join-Path $env:windir (Join-Path 'INF' $publishedInf)
+	        if (Test-Path $publishedInfPath) {
+	          try {
+	            Add-PrinterDriver -Name $expectedDriverName -InfPath $publishedInfPath -ErrorAction Stop
+          } catch {}
+        }
+        $driver = Get-PrinterDriver -Name $expectedDriverName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $driver) {
+          $driver = Get-PrinterDriver | Where-Object {
+            $_.InfPath -and ([System.IO.Path]::GetFileName($_.InfPath).ToLower() -eq $publishedInf.ToLower())
+	          } | Select-Object -First 1
+	        }
+	      }
+	      if (-not $driver -and $expectedDriverName) {
+	        $driverInfCandidate = ''
+	        if ($infPath -and (Test-Path $infPath)) {
+	          $driverInfCandidate = $infPath
+	        } elseif ($publishedInf) {
+	          $publishedInfPath = Join-Path $env:windir (Join-Path 'INF' $publishedInf)
+	          if (Test-Path $publishedInfPath) {
+	            $driverInfCandidate = $publishedInfPath
+	          }
+	        }
+	        if ($driverInfCandidate) {
+	          try {
+	            & rundll32 printui.dll,PrintUIEntry /ia /m $expectedDriverName /f $driverInfCandidate /q | Out-Null
+	          } catch {}
+	          Start-Sleep -Milliseconds 800
+	          $driver = Get-PrinterDriver -Name $expectedDriverName -ErrorAction SilentlyContinue | Select-Object -First 1
+	        }
+	      }
+	      if (-not $driver) {
+	        $afterDrivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue)
+	        $driver = $afterDrivers | Where-Object { $_.Name -notin $beforeDrivers } | Select-Object -First 1
+	      }
+      if (-not $driver -and $expectedDriverName) {
+        $driver = Get-PrinterDriver | Where-Object { $_.Name -like "$expectedDriverName*" } | Select-Object -First 1
+      }
+      if (-not $driver -and $expectedDriverName) {
+        $driver = Get-PrinterDriver | Where-Object { $expectedDriverName -like "$($_.Name)*" } | Select-Object -First 1
+      }
+    } else {
+      $driver = Get-PrinterDriver -Name $expectedDriverName -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+	    $driverName = if ($driver) { $driver.Name } else { $expectedDriverName }
+	    if (-not $driverName) {
+	      if ($infPath) {
+	        throw "Driver not available after installation. Expected driver: $expectedDriverName. pnputil output: $pnpOutput"
+	      } else {
+	        throw "INF file not found in backup folder and expected driver is not present in system: $expectedDriverName"
+	      }
+	    }
+    $isUsbProfile = $preferredPort -and $preferredPort -match '(?i)^USB'
+    if ($isUsbProfile) {
+      [PSCustomObject]@{
+        status = 'driver-installed'
+        printerName = $printerName
+        driverName = $driverName
+        portName = ''
+      } | ConvertTo-Json -Compress
+      return
+    }
+
+    if ($preferredPortHost) {
+      $portByHost = (Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object { $_.PrinterHostAddress -eq $preferredPortHost } | Select-Object -First 1)
+      if ($portByHost) {
+        $preferredPort = $portByHost.Name
+      } else {
+        # If user explicitly sets IP in wizard, always use host-derived port name,
+        # so we don't accidentally keep using the backup-index port identity.
+        $preferredPort = ($preferredPortHost + '_1')
+      }
+    }
+
+    if ($preferredPort -and -not (Get-PrinterPort -Name $preferredPort -ErrorAction SilentlyContinue)) {
+      $tcpHost = $preferredPortHost
+      if (-not $tcpHost -and $preferredPort -match '^(\\d{1,3}(?:\\.\\d{1,3}){3})[_-]\\d+$') {
+        $tcpHost = $matches[1]
+      }
+      if ($tcpHost) {
+        try {
+          Add-PrinterPort -Name $preferredPort -PrinterHostAddress $tcpHost -ErrorAction Stop
+        } catch {
+          # ignore recreate failures and fallback later
+        }
+      }
+    }
+
+    $portToUse = $preferredPort
+    if (-not $portToUse -or -not (Get-PrinterPort -Name $portToUse -ErrorAction SilentlyContinue)) {
+      if ($preferredPortHost) {
+        $portToUse = (Get-PrinterPort | Where-Object { $_.PrinterHostAddress -eq $preferredPortHost } | Select-Object -First 1).Name
+      }
+      if (-not $portToUse) {
+        $portToUse = (Get-PrinterPort | Where-Object {
+          $_.Name -notin @('FILE:', 'PORTPROMPT:', 'NUL:') -and $_.PrinterHostAddress
+        } | Select-Object -First 1).Name
+      }
+    }
+    if (-not $portToUse) {
+      $portToUse = 'PORTPROMPT:'
+    }
+    if (-not (Get-PrinterPort -Name $portToUse -ErrorAction SilentlyContinue) -and $portToUse -ne 'PORTPROMPT:') {
+      $portToUse = 'PORTPROMPT:'
+    }
+
+	    try {
+	      Add-Printer -Name $printerName -DriverName $driverName -PortName $portToUse -ErrorAction Stop
+	    } catch {
+	      if ($portToUse -ne 'PORTPROMPT:') {
+	        try {
+	          Add-Printer -Name $printerName -DriverName $driverName -PortName 'PORTPROMPT:' -ErrorAction Stop
+	          $portToUse = 'PORTPROMPT:'
+	        } catch {
+	          throw "Add-Printer failed with driver '$driverName': $($_.Exception.Message). pnputil output: $pnpOutput"
+	        }
+	      } else {
+	        throw "Add-Printer failed with driver '$driverName': $($_.Exception.Message). pnputil output: $pnpOutput"
+	      }
+	    }
+
+    [PSCustomObject]@{
+      status = 'installed'
+      printerName = $printerName
+      driverName = $driverName
+      portName = $portToUse
+    } | ConvertTo-Json -Compress
+  

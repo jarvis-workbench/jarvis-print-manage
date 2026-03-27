@@ -1,0 +1,332 @@
+
+    $ErrorActionPreference = 'Stop'
+    $printerName = {{PRINTER_NAME}}
+    $targetRoot = {{TARGET_ROOT}}
+
+    $printer = Get-Printer -Name $printerName | Select-Object -First 1
+    if (-not $printer) {
+      throw "Printer not found: $printerName"
+    }
+
+    $driver = Get-PrinterDriver -Name $printer.DriverName | Select-Object -First 1
+    if (-not $driver) {
+      throw "Driver not found for printer: $printerName"
+    }
+    $port = Get-PrinterPort -Name $printer.PortName -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    $safeName = $driver.Name -replace '[\\/:*?"<>|]', '_'
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dest = Join-Path $targetRoot "$safeName-$timestamp"
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+    function Get-InfReferencedFiles {
+      param([string]$InfPath)
+      $names = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return @()
+      }
+
+      $inSourceDisksFiles = $false
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+
+        if ($line -match '^\\[(.+)\\]$') {
+          $sectionName = $matches[1].Trim()
+          $inSourceDisksFiles = $sectionName -match '(?i)^SourceDisksFiles(\\.|$)'
+          continue
+        }
+
+        if ($line -match '(?i)^CatalogFile(?:\\.[^=]+)?\\s*=\\s*([^,;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^DriverFile\\s*=\\s*([^,;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^ConfigFile\\s*=\\s*([^,;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^DataFile\\s*=\\s*([^,;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^HelpFile\\s*=\\s*([^,;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^PrintProcessor\\s*=\\s*"?[^",;]+[, ]+([^",;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+        if ($line -match '(?i)^LanguageMonitor\\s*=\\s*"?[^",;]+[, ]+([^",;]+)') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+
+        if ($inSourceDisksFiles -and $line -match '^([^=,;\\s]+)\\s*=') {
+          $null = $names.Add($matches[1].Trim().Trim('"'))
+        }
+      }
+
+      return @($names)
+    }
+
+    function Find-FileInRoots {
+      param(
+        [string]$FileName,
+        [string[]]$Roots
+      )
+
+      foreach ($root in $Roots) {
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        $direct = Join-Path $root $FileName
+        if (Test-Path $direct) {
+          return (Resolve-Path $direct).Path
+        }
+      }
+
+      foreach ($root in $Roots) {
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        try {
+          $found = Get-ChildItem -Path $root -Filter $FileName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($found) {
+            return $found.FullName
+          }
+        } catch {}
+      }
+
+      return ''
+    }
+
+    function Find-InfMappedSourceFileName {
+      param(
+        [string]$InfPath,
+        [string]$TargetFileName
+      )
+
+      if (-not $InfPath -or -not $TargetFileName -or -not (Test-Path $InfPath)) {
+        return ''
+      }
+      $escaped = [regex]::Escape($TargetFileName)
+      $pattern = '(?i)^\\s*' + $escaped + '\\s*,\\s*([^"]+?)\\s*$'
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+        if ($line -match $pattern) {
+          $candidate = $matches[1].Trim().Trim('"')
+          if ($candidate -and $candidate -match '^[^\\/:*?"<>|]+\\.[A-Za-z0-9_]{1,5}$') {
+            return $candidate
+          }
+        }
+      }
+      return ''
+    }
+
+    function Ensure-InfSourceLayout {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+
+      $infDir = Split-Path -Path $InfPath -Parent
+      $diskMap = @{}
+      $fileMap = @()
+      $currentSection = ''
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+
+        if ($line -match '^\\[(.+)\\]$') {
+          $currentSection = $matches[1].Trim().ToLower()
+          continue
+        }
+
+        if ($currentSection -eq 'sourcedisksnames' -or $currentSection -eq 'sourcedisksnames.amd64') {
+          if ($line -match '^\\s*(\\d+)\\s*=\\s*[^,]*,[^,]*,[^,]*,\\s*"?(.*?)"?\\s*$') {
+            $diskId = $matches[1]
+            $diskPath = $matches[2].Trim()
+            $diskMap[$diskId] = $diskPath
+          }
+          continue
+        }
+
+        if ($currentSection -match '^sourcedisksfiles(\\.|$)') {
+          if ($line -match '^\\s*([^=,;\\s]+)\\s*=\\s*(\\d+)') {
+            $fileName = $matches[1].Trim()
+            $diskId = $matches[2].Trim()
+            $fileMap += [PSCustomObject]@{
+              fileName = $fileName
+              diskId = $diskId
+            }
+          }
+        }
+      }
+
+      foreach ($item in $fileMap) {
+        $fileName = $item.fileName
+        $diskId = $item.diskId
+        $subPath = ''
+        if ($diskMap.ContainsKey($diskId)) {
+          $subPath = [string]$diskMap[$diskId]
+        }
+        if (-not $subPath) { continue }
+
+        $sourceRootPath = Join-Path $infDir $fileName
+        $targetPath = Join-Path $infDir (Join-Path $subPath $fileName)
+        if ((-not (Test-Path $targetPath)) -and (Test-Path $sourceRootPath)) {
+          $targetDir = Split-Path -Path $targetPath -Parent
+          if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          }
+          try {
+            Copy-Item -LiteralPath $sourceRootPath -Destination $targetPath -Force
+          } catch {}
+        }
+      }
+    }
+
+    $infName = [System.IO.Path]::GetFileName($driver.InfPath)
+    $publishedInfName = ''
+    $enumText = (& pnputil.exe /enum-drivers 2>&1 | Out-String)
+    $blocks = $enumText -split '(?ms)\\r?\\n\\s*\\r?\\n'
+    foreach ($block in $blocks) {
+      $lower = $block.ToLower()
+      $matched = $false
+      if ($driver.Name -and $lower.Contains($driver.Name.ToLower())) {
+        $matched = $true
+      }
+      if (-not $matched -and $infName -and $lower.Contains($infName.ToLower())) {
+        $matched = $true
+      }
+      if ($matched -and $block -match '(?im)Published Name\\s*:\\s*(oem\\d+\\.inf)') {
+        $publishedInfName = $matches[1]
+        break
+      }
+    }
+    if (-not $publishedInfName -and $infName -and $infName -match '^oem\\d+\\.inf$') {
+      $publishedInfName = $infName
+    }
+
+    $usedPnpUtil = $false
+    if ($publishedInfName) {
+      $proc = Start-Process -FilePath 'pnputil.exe' -ArgumentList @('/export-driver', $publishedInfName, $dest) -NoNewWindow -Wait -PassThru
+      if ($proc.ExitCode -eq 0) {
+        $usedPnpUtil = $true
+      }
+    }
+
+    $effectiveInfPath = $driver.InfPath
+    if (-not $usedPnpUtil) {
+      $candidateInfPaths = @()
+      if ($driver.InfPath -and (Test-Path $driver.InfPath)) {
+        $candidateInfPaths += (Resolve-Path $driver.InfPath).Path
+      }
+      if ($infName) {
+        $winInfPath = Join-Path $env:windir (Join-Path 'INF' $infName)
+        if (Test-Path $winInfPath) {
+          $candidateInfPaths += (Resolve-Path $winInfPath).Path
+        }
+      }
+      if ($publishedInfName) {
+        $publishedInfPath = Join-Path $env:windir (Join-Path 'INF' $publishedInfName)
+        if (Test-Path $publishedInfPath) {
+          $candidateInfPaths += (Resolve-Path $publishedInfPath).Path
+        }
+      }
+      $candidateInfPaths = $candidateInfPaths | Select-Object -Unique
+      if (-not $candidateInfPaths -or $candidateInfPaths.Count -eq 0) {
+        throw "INF file not found for driver: $($driver.Name)"
+      }
+
+      $resolvedInfPath = $candidateInfPaths | Select-Object -First 1
+      $effectiveInfPath = $resolvedInfPath
+      $infDir = Split-Path -Path $resolvedInfPath -Parent
+      $infBaseName = [System.IO.Path]::GetFileName($resolvedInfPath)
+
+      Copy-Item -LiteralPath $resolvedInfPath -Destination (Join-Path $dest $infBaseName) -Force
+
+      $searchRoots = @($infDir)
+      $metaFiles = @($driver.ConfigFile, $driver.DataFile, $driver.DriverPath, $driver.HelpFile)
+      foreach ($metaFile in $metaFiles) {
+        if ($metaFile -and (Test-Path $metaFile)) {
+          $searchRoots += (Split-Path -Path $metaFile -Parent)
+        }
+      }
+      foreach ($depFile in $driver.DependentFiles) {
+        if ($depFile -and (Test-Path $depFile)) {
+          $searchRoots += (Split-Path -Path $depFile -Parent)
+        }
+      }
+
+      $driverStoreRoot = Join-Path $env:windir 'System32\\DriverStore\\FileRepository'
+      if (Test-Path $driverStoreRoot) {
+        $pkgDirs = Get-ChildItem -Path $driverStoreRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+          Test-Path (Join-Path $_.FullName $infBaseName)
+        } | Select-Object -ExpandProperty FullName
+        $searchRoots += $pkgDirs
+      }
+
+      $searchRoots += (Join-Path $env:windir 'INF')
+      $searchRoots += (Join-Path $env:windir 'System32\\spool\\drivers\\x64\\3')
+      $searchRoots += (Join-Path $env:windir 'System32\\spool\\drivers\\x64\\PCC')
+      $searchRoots += (Join-Path $env:windir 'System32\\spool\\drivers\\x64')
+      $searchRoots = $searchRoots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+      $requiredFileNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+      $requiredFromInf = Get-InfReferencedFiles -InfPath $resolvedInfPath
+      foreach ($f in $requiredFromInf) {
+        if ($f) { $null = $requiredFileNames.Add($f) }
+      }
+      foreach ($f in $metaFiles) {
+        if ($f) { $null = $requiredFileNames.Add([System.IO.Path]::GetFileName($f)) }
+      }
+      foreach ($f in $driver.DependentFiles) {
+        if ($f) { $null = $requiredFileNames.Add([System.IO.Path]::GetFileName($f)) }
+      }
+
+      $copiedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+      $missingFiles = @()
+      foreach ($fileName in $requiredFileNames) {
+        if (-not $fileName) { continue }
+        $foundPath = Find-FileInRoots -FileName $fileName -Roots $searchRoots
+        if (-not $foundPath) {
+          $mappedSourceName = Find-InfMappedSourceFileName -InfPath $resolvedInfPath -TargetFileName $fileName
+          if ($mappedSourceName) {
+            $mappedSourcePath = Find-FileInRoots -FileName $mappedSourceName -Roots $searchRoots
+            if ($mappedSourcePath) {
+              Copy-Item -LiteralPath $mappedSourcePath -Destination (Join-Path $dest $fileName) -Force
+              $null = $copiedNames.Add($fileName)
+              continue
+            }
+          }
+          $missingFiles += $fileName
+          continue
+        }
+        if ($copiedNames.Contains($fileName)) { continue }
+        Copy-Item -LiteralPath $foundPath -Destination (Join-Path $dest $fileName) -Force
+        $null = $copiedNames.Add($fileName)
+      }
+
+      if ($copiedNames.Count -eq 0) {
+        throw "Failed to build driver backup package. No additional driver files were found."
+      }
+
+      Ensure-InfSourceLayout -InfPath (Join-Path $dest $infBaseName)
+      $missingFiles = $missingFiles | Select-Object -Unique
+    } else {
+      $missingFiles = @()
+    }
+
+    [PSCustomObject]@{
+      printerName = $printer.Name
+      driverName = $driver.Name
+      driverVersion = $driver.DriverVersion
+      manufacturer = $driver.Manufacturer
+      environment = $driver.PrinterEnvironment
+      portName = $printer.PortName
+      portHostAddress = if ($port) { $port.PrinterHostAddress } else { '' }
+      portNumber = if ($port) { $port.PortNumber } else { '' }
+      infPath = $effectiveInfPath
+      backupDir = $dest
+      method = if ($usedPnpUtil) { 'pnputil-export-driver' } else { 'copy-required-files' }
+      missingFiles = $missingFiles
+    } | ConvertTo-Json -Compress
+  

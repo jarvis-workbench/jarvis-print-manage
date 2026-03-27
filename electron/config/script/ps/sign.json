@@ -1,0 +1,42 @@
+{
+  "algorithm": "sha256",
+  "appId": "cc.eu.iiot.hs.tool",
+  "generatedAt": "2026-03-27T14:25:38.102Z",
+  "scripts": {
+    "open-system-add-printer-wizard": {
+      "file": "open-system-add-printer-wizard.ps1s",
+      "hash": "601aadded988dfcea38028001922f562a59c69ea55d43fcdeafc7908e687e701",
+      "appHash": "2c7f57454d846d6e572ff983b94e41e9e64516d17cf70a3e2eca64879d7cef99"
+    },
+    "list-installed-printers": {
+      "file": "list-installed-printers.ps1s",
+      "hash": "15c4a4e1154697ff64ed3d2ddb07432b2f0eac7789180ca3585ad841774b80e7",
+      "appHash": "c355eeebb6ba430d8f0afa0aa47ffa17940b686188a455fc166104b7eb63ea31"
+    },
+    "list-usb-printer-ports": {
+      "file": "list-usb-printer-ports.ps1s",
+      "hash": "a7275e54a486124ebd6c4f1b0228a47b9758c3befa66bd67a557f551c066ac6a",
+      "appHash": "730c702a0bf96794db70dc5f891b72d7a421d0f39fbe12b3e3d49d820fa86396"
+    },
+    "backup-printer-driver": {
+      "file": "backup-printer-driver.ps1s",
+      "hash": "a3dd7fe47bef290a9d41e11da2800f09ec7b7547ed22b7c627e3fb665dbc132f",
+      "appHash": "2b97d6a3fcad3c8c8f34374a7c5de49555ac808ae521bfb2e761b48eb0889b14"
+    },
+    "install-printer-from-backup": {
+      "file": "install-printer-from-backup.ps1s",
+      "hash": "ba6c124a254cac8e2c6c4ea7ddb641216ce298be656dc447119309fe43b4fe63",
+      "appHash": "b1cf8251d2fe0501b07d20476fc77e7fdf89bdeaecec3f82eed16137976b8042"
+    },
+    "ping-host": {
+      "file": "ping-host.ps1s",
+      "hash": "bcaa42049e99e834c93ff29bf9742ef3101a578d81774bcdd08b5a48f086fa73",
+      "appHash": "ef694b69ea0df269f41db6e73adb42c51d85ed06f438513c17fc182856d3e5a1"
+    },
+    "uninstall-printer": {
+      "file": "uninstall-printer.ps1s",
+      "hash": "c00d122a41cf66af6dd374c56d57be6f8af7e793498c2efa6d712547795f6954",
+      "appHash": "f93991c9500d855f4db0910aa9d2288b45e65c4c868a5444f612659736119f96"
+    }
+  }
+}

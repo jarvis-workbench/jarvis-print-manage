@@ -1,0 +1,19 @@
+
+    $ErrorActionPreference = 'Stop'
+    $attempts = @(
+      @{ file = 'rundll32.exe'; args = 'printui.dll,PrintUIEntry /im' },
+      @{ file = 'rundll32.exe'; args = 'printui.dll,PrintUIEntry /il' },
+      @{ file = 'rundll32.exe'; args = 'shell32.dll,SHHelpShortcuts_RunDLL AddPrinter' }
+    )
+    $lastError = ''
+    foreach ($attempt in $attempts) {
+      try {
+        Start-Process -FilePath $attempt.file -ArgumentList $attempt.args -WindowStyle Normal -ErrorAction Stop | Out-Null
+        [PSCustomObject]@{ status = 'opened' } | ConvertTo-Json -Compress
+        return
+      } catch {
+        $lastError = $_.Exception.Message
+      }
+    }
+    throw "Failed to open Add Printer wizard: $lastError"
+  

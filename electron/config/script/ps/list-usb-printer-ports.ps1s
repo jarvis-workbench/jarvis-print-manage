@@ -1,0 +1,23 @@
+
+    $ErrorActionPreference = 'Stop'
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($spooler -and $spooler.Status -ne 'Running') {
+      try {
+        Start-Service -Name spooler -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
+      } catch {}
+    }
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if (-not $spooler -or $spooler.Status -ne 'Running') {
+      @() | ConvertTo-Json -Compress
+      return
+    }
+
+    $ports = @(
+      Get-PrinterPort -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '(?i)^USB[0-9]+$' } |
+        Select-Object -ExpandProperty Name -Unique |
+        Sort-Object
+    )
+    $ports | ConvertTo-Json -Compress
+  
