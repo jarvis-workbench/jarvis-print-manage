@@ -27,8 +27,8 @@
     "wait-on": "^9.0.4"
   },
   "build": {
-    "appId": "com.eledrive.app",
-    "productName": "EleDrive",
+    "appId": "hs.print.iiot.eu.cc",
+    "productName": "虹色打印机助手",
     "files": [
       "dist/**/*",
       "electron/**/*",
