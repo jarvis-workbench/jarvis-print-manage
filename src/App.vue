@@ -1,16 +1,34 @@
 ﻿<script setup>
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Home, Printer, SettingConfig } from '@icon-park/vue-next'
 
 const route = useRoute()
 const router = useRouter()
+let removeTrayNavigateListener = null
 
 const activePath = computed(() => route.path)
 
 function handleMenuSelect(path) {
   if (path !== route.path) router.push(path)
 }
+
+onMounted(() => {
+  if (!window.eleDrive?.onTrayNavigate) return
+  removeTrayNavigateListener = window.eleDrive.onTrayNavigate((payload) => {
+    const targetPath = String(payload?.path || '/')
+    if (targetPath !== route.path) {
+      router.push(targetPath)
+    }
+  })
+})
+
+onUnmounted(() => {
+  if (typeof removeTrayNavigateListener === 'function') {
+    removeTrayNavigateListener()
+  }
+  removeTrayNavigateListener = null
+})
 </script>
 
 <template>

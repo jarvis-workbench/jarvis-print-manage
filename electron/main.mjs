@@ -1,5 +1,6 @@
-﻿import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+﻿import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } from 'electron'
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +14,11 @@ const APP_TITLE = '虹色图文助手'
 const THEME_MODES = new Set(['light', 'dark', 'system'])
 const INDEX_FILE_NAME = 'driver-index.json'
 const BACKUP_META_FILE_NAME = 'driver-backup.json'
+const TRAY_ICON_NAME = 'tray.png'
+
+let mainWindow = null
+let tray = null
+let appIsQuitting = false
 
 function getSettingsFilePath() {
   return path.join(app.getPath('userData'), 'settings.json')
@@ -1550,6 +1556,86 @@ async function uninstallPrinter({ printerName }) {
   return runPowerShellJson(script)
 }
 
+function getTrayIcon() {
+  const candidates = [
+    path.join(__dirname, TRAY_ICON_NAME),
+    path.join(app.getAppPath(), 'electron', TRAY_ICON_NAME),
+  ]
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue
+    const icon = nativeImage.createFromPath(candidate)
+    if (!icon.isEmpty()) {
+      return process.platform === 'win32' ? icon.resize({ width: 16, height: 16 }) : icon
+    }
+  }
+
+  return null
+}
+
+function navigateMainWindow(pathName = '/') {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  const payload = { path: pathName || '/' }
+  const send = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send('app:navigate', payload)
+  }
+
+  if (mainWindow.webContents.isLoadingMainFrame()) {
+    mainWindow.webContents.once('did-finish-load', send)
+  } else {
+    send()
+  }
+}
+
+function showMainWindow(pathName = '') {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow()
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  if (!mainWindow.isVisible()) mainWindow.show()
+  mainWindow.focus()
+
+  if (pathName) {
+    navigateMainWindow(pathName)
+  }
+}
+
+function createTray() {
+  if (tray) return tray
+
+  const trayIcon = getTrayIcon()
+  if (!trayIcon) {
+    console.warn('[tray] tray icon not found, skip tray initialization.')
+    return null
+  }
+
+  tray = new Tray(trayIcon)
+  tray.setToolTip(APP_TITLE)
+
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: '打开主界面',
+      click: () => showMainWindow('/'),
+    },
+    {
+      label: '打印机管理',
+      click: () => showMainWindow('/printers'),
+    },
+    {
+      label: '系统设置',
+      click: () => showMainWindow('/settings'),
+    },
+  ])
+
+  tray.setContextMenu(contextMenu)
+  tray.on('click', () => showMainWindow('/'))
+  return tray
+}
+
 function createMainWindow() {
   const win = new BrowserWindow({
     width: 1000,
@@ -1569,6 +1655,20 @@ function createMainWindow() {
       nodeIntegration: false,
       sandbox: false,
     },
+  })
+
+  mainWindow = win
+
+  win.on('close', (event) => {
+    if (appIsQuitting) return
+    event.preventDefault()
+    win.hide()
+  })
+
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null
+    }
   })
 
   win.on('page-title-updated', (event) => {
@@ -1591,6 +1691,8 @@ function createMainWindow() {
     shell.openExternal(url)
     return { action: 'deny' }
   })
+
+  return win
 }
 
 app.whenReady().then(() => {
@@ -1674,12 +1776,15 @@ app.whenReady().then(() => {
   })
 
   createMainWindow()
+  createTray()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow()
-    }
+    showMainWindow('/')
   })
+})
+
+app.on('before-quit', () => {
+  appIsQuitting = true
 })
 
 app.on('window-all-closed', () => {
@@ -1687,3 +1792,5 @@ app.on('window-all-closed', () => {
     app.quit()
   }
 })
+
+

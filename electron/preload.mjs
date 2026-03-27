@@ -14,4 +14,10 @@ contextBridge.exposeInMainWorld('eleDrive', {
   pingHost: (payload) => ipcRenderer.invoke('printers:ping-host', payload),
   uninstallPrinter: (payload) => ipcRenderer.invoke('printers:uninstall', payload),
   getDriverIndex: () => ipcRenderer.invoke('drivers:index:get'),
+  onTrayNavigate: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('app:navigate', listener)
+    return () => ipcRenderer.removeListener('app:navigate', listener)
+  },
 })

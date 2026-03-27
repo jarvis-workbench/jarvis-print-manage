@@ -100,5 +100,6 @@ interface Window {
         entries: DriverIndexEntry[]
       }
     }>
+    onTrayNavigate: (handler: (payload: { path?: string } | null) => void) => () => void
   }
 }
