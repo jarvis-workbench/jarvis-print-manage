@@ -1,0 +1,94 @@
+:root {
+  font-family: Segoe UI, PingFang SC, Microsoft YaHei, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #1f2937;
+  background: #f3f4f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px;
+}
+
+.topbar {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  color: #111827;
+  text-decoration: none;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.nav {
+  display: flex;
+  gap: 10px;
+}
+
+.nav-link {
+  color: #4b5563;
+  text-decoration: none;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+}
+
+.nav-link:hover {
+  border-color: #d1d5db;
+}
+
+.nav-link.router-link-active {
+  color: #111827;
+  background: #ffffff;
+  border-color: #d1d5db;
+}
+
+.card {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  padding: 28px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08);
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 32px;
+}
+
+p {
+  margin: 8px 0;
+}
+
+.hint {
+  margin-top: 14px;
+  color: #6b7280;
+}
