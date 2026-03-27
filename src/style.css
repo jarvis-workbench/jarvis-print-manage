@@ -70,8 +70,11 @@ body {
 
 .brand-subtitle {
   color: var(--app-muted);
-  font-size: 11px;
+  font-size: 10px;
   margin: 3px 6px 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nav-menu {
@@ -161,6 +164,12 @@ body {
   gap: 10px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 h1 {
   margin: 0;
   font-size: 20px;
@@ -247,6 +256,27 @@ p {
   gap: 6px;
 }
 
+.printer-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.printer-tag {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+.printer-cell-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.printer-cell-main .cell-title {
+  margin-top: 0;
+}
+
 .cell-title {
   margin-top: 4px;
   font-size: 12px;
@@ -271,6 +301,17 @@ p {
 .mono {
   font-family: Consolas, 'Courier New', monospace;
   font-size: 11px;
+}
+
+.add-printer-dialog-body {
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 :root[data-theme='dark'] .el-card,
