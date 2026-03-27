@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const execFileAsync = promisify(execFile)
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
-const APP_TITLE = '虹色打印机助手'
+const APP_TITLE = '虹色图文助手'
 const THEME_MODES = new Set(['light', 'dark', 'system'])
 const INDEX_FILE_NAME = 'driver-index.json'
 const BACKUP_META_FILE_NAME = 'driver-backup.json'
@@ -55,10 +55,15 @@ async function runPowerShellJson(script) {
     $__codexResult = & {
       ${script}
     }
-    if ($__codexResult -is [string]) {
+    if ($null -eq $__codexResult) {
+      $__codexJson = 'null'
+    } elseif ($__codexResult -is [string]) {
       $__codexJson = $__codexResult
     } else {
       $__codexJson = $__codexResult | ConvertTo-Json -Depth 12 -Compress
+    }
+    if ($null -eq $__codexJson -or $__codexJson -eq '') {
+      $__codexJson = 'null'
     }
     [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__codexJson))
   `
@@ -76,6 +81,29 @@ async function runPowerShellJson(script) {
   } catch {
     throw new Error(stderr || `Failed to parse PowerShell JSON output: ${jsonText}`)
   }
+}
+
+async function openSystemAddPrinterWizard() {
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $attempts = @(
+      @{ file = 'rundll32.exe'; args = 'printui.dll,PrintUIEntry /im' },
+      @{ file = 'rundll32.exe'; args = 'printui.dll,PrintUIEntry /il' },
+      @{ file = 'rundll32.exe'; args = 'shell32.dll,SHHelpShortcuts_RunDLL AddPrinter' }
+    )
+    $lastError = ''
+    foreach ($attempt in $attempts) {
+      try {
+        Start-Process -FilePath $attempt.file -ArgumentList $attempt.args -WindowStyle Normal -ErrorAction Stop | Out-Null
+        [PSCustomObject]@{ status = 'opened' } | ConvertTo-Json -Compress
+        return
+      } catch {
+        $lastError = $_.Exception.Message
+      }
+    }
+    throw "Failed to open Add Printer wizard: $lastError"
+  `
+  return runPowerShellJson(script)
 }
 
 function getDefaultBackupDir() {
@@ -252,6 +280,112 @@ async function findInfRelativePath(backupPath, preferredInfName = '') {
   return preferred || found[0]
 }
 
+function isRawDriverVersionValue(value) {
+  const text = String(value || '').trim()
+  return /^\d{10,}$/.test(text)
+}
+
+function extractDriverVerFromInfText(text) {
+  if (!text) return null
+  const lines = String(text).split(/\r?\n/)
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith(';')) continue
+    const match = line.match(/^DriverVer(?:\.[^=]+)?\s*=\s*([^,]+)\s*,\s*([^\s,;][^;]*)$/i)
+    if (!match) continue
+    const rawDate = String(match[1] || '').trim()
+    const rawVersion = String(match[2] || '').trim()
+    if (!rawVersion) continue
+    return {
+      version: rawVersion,
+      date: rawDate,
+    }
+  }
+  return null
+}
+
+async function readDriverVerFromInfFile(infFilePath) {
+  if (!infFilePath) return null
+  try {
+    const content = await fs.readFile(infFilePath, 'utf-8')
+    return extractDriverVerFromInfText(content)
+  } catch {
+    return null
+  }
+}
+
+async function resolveSystemInfPath(infPathValue = '') {
+  const raw = String(infPathValue || '').trim()
+  if (!raw) return ''
+  const checkCandidate = async (candidate) => {
+    try {
+      const stat = await fs.stat(candidate)
+      if (stat.isFile()) return candidate
+    } catch {}
+    return ''
+  }
+
+  if (path.isAbsolute(raw)) {
+    const found = await checkCandidate(raw)
+    if (found) return found
+  }
+
+  const windir = process.env.windir || process.env.WINDIR || 'C:\\Windows'
+  if (raw.toLowerCase().endsWith('.inf')) {
+    const found = await checkCandidate(path.join(windir, 'INF', raw))
+    if (found) return found
+  }
+
+  return ''
+}
+
+function normalizeDriverVersionDisplay(fallbackValue, parsedInf) {
+  const infVersion = String(parsedInf?.version || '').trim()
+  if (infVersion) return infVersion
+  const fallback = String(fallbackValue || '').trim()
+  if (!fallback) return ''
+  if (isRawDriverVersionValue(fallback)) return ''
+  return fallback
+}
+
+async function normalizeInstalledDriverVersion(driver) {
+  if (!driver) return driver
+  const infPath = await resolveSystemInfPath(driver.infPath)
+  const parsedInf = await readDriverVerFromInfFile(infPath)
+  return {
+    ...driver,
+    driverVersion: normalizeDriverVersionDisplay(driver.driverVersion, parsedInf),
+  }
+}
+
+async function normalizeIndexDriverVersions(backupDir, indexObj) {
+  if (!indexObj?.entries?.length) return indexObj
+  let changed = false
+  const nextEntries = await Promise.all(
+    indexObj.entries.map(async (entry) => {
+      const needsNormalize = !entry.driverVersion || isRawDriverVersionValue(entry.driverVersion)
+      if (!needsNormalize) return entry
+      const infPath = entry.infRelativePath
+        ? path.join(backupDir, entry.backupSubDir || '', entry.infRelativePath)
+        : ''
+      const parsedInf = await readDriverVerFromInfFile(infPath)
+      const nextVersion = normalizeDriverVersionDisplay(entry.driverVersion, parsedInf)
+      if (nextVersion === entry.driverVersion) return entry
+      changed = true
+      return {
+        ...entry,
+        driverVersion: nextVersion,
+      }
+    }),
+  )
+
+  if (!changed) return indexObj
+  return writeIndexFile(backupDir, {
+    ...indexObj,
+    entries: nextEntries,
+  })
+}
+
 async function readSettings() {
   try {
     const fileText = await fs.readFile(getSettingsFilePath(), 'utf-8')
@@ -283,8 +417,21 @@ async function writeSettings(nextSettings) {
 async function getInstalledPrinters() {
   const script = `
     $ErrorActionPreference = 'Stop'
-    $printers = Get-Printer | Select-Object Name, DriverName, PortName, Shared, ShareName
-    $drivers = Get-PrinterDriver | Select-Object Name, Manufacturer, MajorVersion, DriverVersion, InfPath, PrinterEnvironment
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($spooler -and $spooler.Status -ne 'Running') {
+      try {
+        Start-Service -Name spooler -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
+      } catch {}
+    }
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if (-not $spooler -or $spooler.Status -ne 'Running') {
+      @() | ConvertTo-Json -Compress
+      return
+    }
+
+    $printers = @(Get-Printer -ErrorAction SilentlyContinue | Select-Object Name, DriverName, PortName, Shared, ShareName, PrinterStatus, WorkOffline)
+    $drivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object Name, Manufacturer, MajorVersion, DriverVersion, InfPath, PrinterEnvironment)
     $result = foreach ($printer in $printers) {
       $driver = $drivers | Where-Object { $_.Name -eq $printer.DriverName } | Select-Object -First 1
       [PSCustomObject]@{
@@ -293,6 +440,8 @@ async function getInstalledPrinters() {
         portName = $printer.PortName
         shared = [bool]$printer.Shared
         shareName = $printer.ShareName
+        printerStatus = $printer.PrinterStatus
+        workOffline = [bool]$printer.WorkOffline
         driver = if ($driver) {
           [PSCustomObject]@{
             name = $driver.Name
@@ -312,7 +461,49 @@ async function getInstalledPrinters() {
 
   const data = await runPowerShellJson(script)
   const list = Array.isArray(data) ? data : data ? [data] : []
-  return list.filter((item) => !isVirtualPrinter(item))
+  const filtered = list.filter((item) => !isVirtualPrinter(item))
+  const normalized = await Promise.all(
+    filtered.map(async (item) => ({
+      ...item,
+      driver: item.driver ? await normalizeInstalledDriverVersion(item.driver) : item.driver,
+    })),
+  )
+  return normalized
+}
+
+async function listUsbPrinterPorts() {
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($spooler -and $spooler.Status -ne 'Running') {
+      try {
+        Start-Service -Name spooler -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
+      } catch {}
+    }
+    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if (-not $spooler -or $spooler.Status -ne 'Running') {
+      @() | ConvertTo-Json -Compress
+      return
+    }
+
+    $ports = @(
+      Get-PrinterPort -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '(?i)^USB[0-9]+$' } |
+        Select-Object -ExpandProperty Name -Unique |
+        Sort-Object
+    )
+    $ports | ConvertTo-Json -Compress
+  `
+
+  const data = await runPowerShellJson(script)
+  if (Array.isArray(data)) {
+    return data.map((item) => String(item))
+  }
+  if (data) {
+    return [String(data)]
+  }
+  return []
 }
 
 async function backupPrinterDriver({ printerName, backupDir }) {
@@ -415,6 +606,95 @@ async function backupPrinterDriver({ printerName, backupDir }) {
       return ''
     }
 
+    function Find-InfMappedSourceFileName {
+      param(
+        [string]$InfPath,
+        [string]$TargetFileName
+      )
+
+      if (-not $InfPath -or -not $TargetFileName -or -not (Test-Path $InfPath)) {
+        return ''
+      }
+      $escaped = [regex]::Escape($TargetFileName)
+      $pattern = '(?i)^\\s*' + $escaped + '\\s*,\\s*([^"]+?)\\s*$'
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+        if ($line -match $pattern) {
+          $candidate = $matches[1].Trim().Trim('"')
+          if ($candidate -and $candidate -match '^[^\\/:*?"<>|]+\\.[A-Za-z0-9_]{1,5}$') {
+            return $candidate
+          }
+        }
+      }
+      return ''
+    }
+
+    function Ensure-InfSourceLayout {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+
+      $infDir = Split-Path -Path $InfPath -Parent
+      $diskMap = @{}
+      $fileMap = @()
+      $currentSection = ''
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+
+        if ($line -match '^\\[(.+)\\]$') {
+          $currentSection = $matches[1].Trim().ToLower()
+          continue
+        }
+
+        if ($currentSection -eq 'sourcedisksnames' -or $currentSection -eq 'sourcedisksnames.amd64') {
+          if ($line -match '^\\s*(\\d+)\\s*=\\s*[^,]*,[^,]*,[^,]*,\\s*"?(.*?)"?\\s*$') {
+            $diskId = $matches[1]
+            $diskPath = $matches[2].Trim()
+            $diskMap[$diskId] = $diskPath
+          }
+          continue
+        }
+
+        if ($currentSection -match '^sourcedisksfiles(\\.|$)') {
+          if ($line -match '^\\s*([^=,;\\s]+)\\s*=\\s*(\\d+)') {
+            $fileName = $matches[1].Trim()
+            $diskId = $matches[2].Trim()
+            $fileMap += [PSCustomObject]@{
+              fileName = $fileName
+              diskId = $diskId
+            }
+          }
+        }
+      }
+
+      foreach ($item in $fileMap) {
+        $fileName = $item.fileName
+        $diskId = $item.diskId
+        $subPath = ''
+        if ($diskMap.ContainsKey($diskId)) {
+          $subPath = [string]$diskMap[$diskId]
+        }
+        if (-not $subPath) { continue }
+
+        $sourceRootPath = Join-Path $infDir $fileName
+        $targetPath = Join-Path $infDir (Join-Path $subPath $fileName)
+        if ((-not (Test-Path $targetPath)) -and (Test-Path $sourceRootPath)) {
+          $targetDir = Split-Path -Path $targetPath -Parent
+          if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          }
+          try {
+            Copy-Item -LiteralPath $sourceRootPath -Destination $targetPath -Force
+          } catch {}
+        }
+      }
+    }
+
     $infName = [System.IO.Path]::GetFileName($driver.InfPath)
     $publishedInfName = ''
     $enumText = (& pnputil.exe /enum-drivers 2>&1 | Out-String)
@@ -515,12 +795,21 @@ async function backupPrinterDriver({ printerName, backupDir }) {
       }
 
       $copiedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-      $missingRequired = @()
+      $missingFiles = @()
       foreach ($fileName in $requiredFileNames) {
         if (-not $fileName) { continue }
         $foundPath = Find-FileInRoots -FileName $fileName -Roots $searchRoots
         if (-not $foundPath) {
-          $missingRequired += $fileName
+          $mappedSourceName = Find-InfMappedSourceFileName -InfPath $resolvedInfPath -TargetFileName $fileName
+          if ($mappedSourceName) {
+            $mappedSourcePath = Find-FileInRoots -FileName $mappedSourceName -Roots $searchRoots
+            if ($mappedSourcePath) {
+              Copy-Item -LiteralPath $mappedSourcePath -Destination (Join-Path $dest $fileName) -Force
+              $null = $copiedNames.Add($fileName)
+              continue
+            }
+          }
+          $missingFiles += $fileName
           continue
         }
         if ($copiedNames.Contains($fileName)) { continue }
@@ -528,10 +817,14 @@ async function backupPrinterDriver({ printerName, backupDir }) {
         $null = $copiedNames.Add($fileName)
       }
 
-      if ($missingRequired.Count -gt 0) {
-        $missingPreview = ($missingRequired | Select-Object -Unique | Select-Object -First 15) -join ', '
-        throw "Failed to build driver backup package. Missing required files: $missingPreview"
+      if ($copiedNames.Count -eq 0) {
+        throw "Failed to build driver backup package. No additional driver files were found."
       }
+
+      Ensure-InfSourceLayout -InfPath (Join-Path $dest $infBaseName)
+      $missingFiles = $missingFiles | Select-Object -Unique
+    } else {
+      $missingFiles = @()
     }
 
     [PSCustomObject]@{
@@ -546,6 +839,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
       infPath = $effectiveInfPath
       backupDir = $dest
       method = if ($usedPnpUtil) { 'pnputil-export-driver' } else { 'copy-required-files' }
+      missingFiles = $missingFiles
     } | ConvertTo-Json -Compress
   `
 
@@ -556,7 +850,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
   const metadata = {
     printerName: result.printerName,
     driverName: result.driverName,
-    driverVersion: String(result.driverVersion || ''),
+    driverVersion: '',
     manufacturer: String(result.manufacturer || ''),
     environment: String(result.environment || ''),
     portName: String(result.portName || ''),
@@ -566,6 +860,10 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     backupAt: new Date().toISOString(),
     method: result.method,
   }
+
+  const backupInfPath = metadata.infRelativePath ? path.join(backupPath, metadata.infRelativePath) : ''
+  const parsedBackupInf = await readDriverVerFromInfFile(backupInfPath)
+  metadata.driverVersion = normalizeDriverVersionDisplay(result.driverVersion, parsedBackupInf)
 
   await fs.writeFile(path.join(backupPath, BACKUP_META_FILE_NAME), JSON.stringify(metadata, null, 2), 'utf-8')
 
@@ -635,6 +933,93 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
     $infFileName = [System.IO.Path]::GetFileName($infPath)
     $beforeDrivers = @(Get-PrinterDriver | Select-Object -ExpandProperty Name)
 
+    function Ensure-InfMappedAliases {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+      $infDir = Split-Path -Path $InfPath -Parent
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+        if ($line -match '^(?i)([^\\/:*?"<>|,=\\s]+\\.[A-Za-z0-9_]{1,5})\\s*,\\s*([^\\/:*?"<>|,=\\s]+\\.[A-Za-z0-9_]{1,5})\\s*$') {
+          $destName = $matches[1]
+          $sourceName = $matches[2]
+          $destPath = Join-Path $infDir $destName
+          $sourcePath = Join-Path $infDir $sourceName
+          if (-not (Test-Path $destPath) -and (Test-Path $sourcePath)) {
+            try {
+              Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force
+            } catch {}
+          }
+        }
+      }
+    }
+
+    function Ensure-InfSourceLayout {
+      param([string]$InfPath)
+      if (-not $InfPath -or -not (Test-Path $InfPath)) {
+        return
+      }
+
+      $infDir = Split-Path -Path $InfPath -Parent
+      $diskMap = @{}
+      $fileMap = @()
+      $currentSection = ''
+
+      foreach ($rawLine in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith(';')) { continue }
+
+        if ($line -match '^\\[(.+)\\]$') {
+          $currentSection = $matches[1].Trim().ToLower()
+          continue
+        }
+
+        if ($currentSection -eq 'sourcedisksnames' -or $currentSection -eq 'sourcedisksnames.amd64') {
+          if ($line -match '^\\s*(\\d+)\\s*=\\s*[^,]*,[^,]*,[^,]*,\\s*"?(.*?)"?\\s*$') {
+            $diskId = $matches[1]
+            $diskPath = $matches[2].Trim()
+            $diskMap[$diskId] = $diskPath
+          }
+          continue
+        }
+
+        if ($currentSection -match '^sourcedisksfiles(\\.|$)') {
+          if ($line -match '^\\s*([^=,;\\s]+)\\s*=\\s*(\\d+)') {
+            $fileName = $matches[1].Trim()
+            $diskId = $matches[2].Trim()
+            $fileMap += [PSCustomObject]@{
+              fileName = $fileName
+              diskId = $diskId
+            }
+          }
+        }
+      }
+
+      foreach ($item in $fileMap) {
+        $fileName = $item.fileName
+        $diskId = $item.diskId
+        $subPath = ''
+        if ($diskMap.ContainsKey($diskId)) {
+          $subPath = [string]$diskMap[$diskId]
+        }
+        if (-not $subPath) { continue }
+
+        $sourceRootPath = Join-Path $infDir $fileName
+        $targetPath = Join-Path $infDir (Join-Path $subPath $fileName)
+        if ((-not (Test-Path $targetPath)) -and (Test-Path $sourceRootPath)) {
+          $targetDir = Split-Path -Path $targetPath -Parent
+          if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          }
+          try {
+            Copy-Item -LiteralPath $sourceRootPath -Destination $targetPath -Force
+          } catch {}
+        }
+      }
+    }
+
     $existing = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
     if ($existing) {
       [PSCustomObject]@{ status = 'already-installed'; printerName = $printerName } | ConvertTo-Json -Compress
@@ -645,6 +1030,17 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
     $pnpOutput = ''
 
     if ($infPath -and (Test-Path $infPath)) {
+      $candidateInfs = @()
+      if (Test-Path $backupPath) {
+        $candidateInfs += @(Get-ChildItem -Path $backupPath -Filter *.inf -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+      }
+      if ($infPath -and (Test-Path $infPath) -and ($candidateInfs -notcontains $infPath)) {
+        $candidateInfs = @($infPath) + $candidateInfs
+      }
+      foreach ($candidateInf in ($candidateInfs | Select-Object -Unique)) {
+        Ensure-InfMappedAliases -InfPath $candidateInf
+        Ensure-InfSourceLayout -InfPath $candidateInf
+      }
       $pnpOutput = (& pnputil.exe /add-driver $infPath /install 2>&1 | Out-String)
       if ($LASTEXITCODE -ne 0) {
         $pnpFallbackOutput = (& pnputil.exe /add-driver (Join-Path $backupPath '*.inf') /subdirs /install 2>&1 | Out-String)
@@ -700,6 +1096,16 @@ async function installPrinterFromBackup({ printerName, backupDir }) {
       }
     }
     $driverName = $driver.Name
+    $isUsbProfile = $preferredPort -and $preferredPort -match '(?i)^USB'
+    if ($isUsbProfile) {
+      [PSCustomObject]@{
+        status = 'driver-installed'
+        printerName = $printerName
+        driverName = $driverName
+        portName = ''
+      } | ConvertTo-Json -Compress
+      return
+    }
 
     if ($preferredPort -and -not (Get-PrinterPort -Name $preferredPort -ErrorAction SilentlyContinue)) {
       $tcpHost = $preferredPortHost
@@ -966,16 +1372,21 @@ async function uninstallPrinter({ printerName }) {
     $portRemoved = $false
     $portRemoveError = ''
     if ($portName) {
-      $portRefs = @(Get-Printer | Where-Object { $_.PortName -eq $portName }).Count
-      if ($portRefs -eq 0) {
-        try {
-          Remove-PrinterPort -Name $portName -ErrorAction Stop
-          $portRemoved = $true
-        } catch {
-          $portRemoveError = $_.Exception.Message
-        }
+      if ($portName.Trim() -match '(?i)^USB') {
+        # Keep USB virtual ports to avoid removal errors and keep reinstall path stable.
+        $portRemoved = $true
       } else {
-        $portRemoveError = "Port still referenced by $portRefs printer(s)."
+        $portRefs = @(Get-Printer | Where-Object { $_.PortName -eq $portName }).Count
+        if ($portRefs -eq 0) {
+          try {
+            Remove-PrinterPort -Name $portName -ErrorAction Stop
+            $portRemoved = $true
+          } catch {
+            $portRemoveError = $_.Exception.Message
+          }
+        } else {
+          $portRemoveError = "Port still referenced by $portRefs printer(s)."
+        }
       }
     }
 
@@ -1153,7 +1564,7 @@ app.whenReady().then(() => {
   })
   ipcMain.handle('settings:choose-backup-dir', async () => {
     const result = await dialog.showOpenDialog({
-      title: '选择备份驱动目录',
+      title: '选择打印机驱动备份目录',
       properties: ['openDirectory', 'createDirectory'],
     })
     if (result.canceled || !result.filePaths?.[0]) {
@@ -1163,6 +1574,8 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('printers:list-installed', async () => getInstalledPrinters())
+  ipcMain.handle('printers:list-usb-ports', async () => listUsbPrinterPorts())
+  ipcMain.handle('printers:open-system-add-wizard', async () => openSystemAddPrinterWizard())
   ipcMain.handle('printers:backup-driver', async (_, payload) => {
     if (!payload?.printerName || typeof payload.printerName !== 'string') {
       throw new Error('Invalid printer name.')
@@ -1195,9 +1608,10 @@ app.whenReady().then(() => {
   ipcMain.handle('drivers:index:get', async () => {
     const settings = await readSettings()
     const indexObj = await ensureBackupIndex(settings.backupDir)
+    const normalizedIndex = await normalizeIndexDriverVersions(settings.backupDir, indexObj)
     return {
       backupDir: settings.backupDir,
-      index: indexObj,
+      index: normalizedIndex,
     }
   })
 

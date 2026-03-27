@@ -12,6 +12,8 @@ interface InstalledPrinter {
   portName: string
   shared: boolean
   shareName?: string
+  printerStatus?: string | number
+  workOffline?: boolean
   driver?: {
     name: string
     manufacturer?: string
@@ -58,6 +60,8 @@ interface Window {
     setThemeMode: (themeMode: ThemeMode) => Promise<EleDriveSettings>
     chooseBackupDir: () => Promise<string | null>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
+    listUsbPrinterPorts: () => Promise<string[]>
+    openSystemAddPrinterWizard: () => Promise<{ status: string }>
     backupPrinterDriver: (payload: {
       printerName: string
       backupDir?: string
