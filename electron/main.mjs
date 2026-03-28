@@ -1,11 +1,12 @@
 ﻿import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } from 'electron'
-import { existsSync } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { loadPsScript } from './config/script/ps/index.mjs'
-import { runPowerShellJson } from './powershell.mjs'
+import { runPowerShell, runPowerShellJson } from './powershell.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -17,13 +18,41 @@ const BACKUP_META_FILE_NAME = 'driver-backup.json'
 const TRAY_ICON_NAME = 'tray.png'
 const PRINTER_STATE_POLL_INTERVAL_MS = 2000
 const SYSTEM_SETTINGS_RELATIVE_PATH = path.join('config', 'system.json')
+const VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH = path.join('config', 'virtual-printer.json')
 const POWERSHELL_TIMEOUT_MS = 30_000
+const ARCHIVE_FORMAT = 'pdrv.zip'
+const ARCHIVE_FILE_SUFFIX = '.pdrv.zip'
+const ARCHIVE_EXTRACT_POLICY_DEFAULT = 'cleanup-on-success'
+const CUSTOM_PROTOCOL_SCHEME = 'hstools'
+const KNOWN_ROUTE_PATHS = new Set(['/', '/printers', '/settings', '/driver-install'])
+const DEFAULT_VIRTUAL_PRINTER_CONFIG = {
+  keywords: [
+    'pdf',
+    'xps',
+    'fax',
+    'onenote',
+    'virtual',
+    'document writer',
+    'microsoft print to pdf',
+    'microsoft xps document writer',
+    'adobe pdf',
+    'foxit pdf',
+    'wps pdf',
+    'doro pdf',
+    'cutepdf',
+    'priprinter',
+  ],
+  exactPorts: ['file:', 'portprompt:', 'nul:'],
+  prefixPorts: ['redir', 'ts'],
+  containsPorts: ['prompt'],
+}
 
 let mainWindow = null
 let tray = null
 let appIsQuitting = false
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let printerStateWorker = null
+let pendingProtocolRoutePath = ''
 let printerRuntimeState = {
   seq: 0,
   changedAt: '',
@@ -114,8 +143,113 @@ function getSettingsFilePath() {
   return path.join(getResourceRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
 }
 
+function getVirtualPrinterConfigPath() {
+  return path.join(getResourceRootPath(), VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH)
+}
+
 function getIndexFilePath(backupDir) {
   return path.join(backupDir, INDEX_FILE_NAME)
+}
+
+function normalizeArchiveFields(entry = {}) {
+  const archiveFileName = String(entry.archiveFileName || '').trim()
+  const archiveRelativePath = String(entry.archiveRelativePath || archiveFileName).trim()
+  const archiveSha256 = String(entry.archiveSha256 || '').trim().toLowerCase()
+  const archiveSizeRaw = Number(entry.archiveSize)
+  const archiveSize = Number.isFinite(archiveSizeRaw) && archiveSizeRaw > 0 ? archiveSizeRaw : 0
+  const archiveFormat = String(entry.archiveFormat || '').trim() || (archiveRelativePath ? ARCHIVE_FORMAT : '')
+  const extractPolicy = String(entry.extractPolicy || '').trim() || ARCHIVE_EXTRACT_POLICY_DEFAULT
+  return {
+    archiveFileName,
+    archiveRelativePath,
+    archiveSha256,
+    archiveSize,
+    archiveFormat,
+    extractPolicy,
+  }
+}
+
+function createArchiveError(code, message) {
+  const error = new Error(`[${code}] ${message}`)
+  error.code = code
+  return error
+}
+
+async function isFileExists(filePath) {
+  try {
+    const stat = await fs.stat(filePath)
+    return stat.isFile()
+  } catch {
+    return false
+  }
+}
+
+async function computeFileSha256(filePath) {
+  const hash = createHash('sha256')
+  return new Promise((resolve, reject) => {
+    const stream = createReadStream(filePath)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+async function createBackupArchive(backupPath, targetRoot) {
+  const backupSubDir = path.basename(backupPath)
+  let archiveFileName = `${backupSubDir}${ARCHIVE_FILE_SUFFIX}`
+  let archivePath = path.join(targetRoot, archiveFileName)
+  let suffix = 1
+  while (await isFileExists(archivePath)) {
+    archiveFileName = `${backupSubDir}-${suffix}${ARCHIVE_FILE_SUFFIX}`
+    archivePath = path.join(targetRoot, archiveFileName)
+    suffix += 1
+  }
+
+  const script = await loadPsScript('printer-archive-create', {
+    SOURCE_PATH: toPsSingleQuote(backupPath),
+    TARGET_PATH: toPsSingleQuote(archivePath),
+  })
+  await runPowerShell(script, { timeoutMs: 120_000 })
+
+  const stat = await fs.stat(archivePath)
+  const archiveSha256 = await computeFileSha256(archivePath)
+  return {
+    archiveFileName,
+    archiveRelativePath: archiveFileName,
+    archiveSha256,
+    archiveSize: stat.size,
+    archiveFormat: ARCHIVE_FORMAT,
+  }
+}
+
+function resolveEntryArchivePath(backupDir, entry = {}) {
+  const archive = normalizeArchiveFields(entry)
+  const archiveRel = archive.archiveRelativePath || archive.archiveFileName
+  if (!archiveRel) return ''
+  return path.join(backupDir, archiveRel)
+}
+
+async function extractBackupArchive(archivePath, taskId) {
+  const extractRoot = path.join(app.getPath('temp'), 'EleDrive', 'extract')
+  const extractDir = path.join(extractRoot, taskId)
+  await fs.rm(extractDir, { recursive: true, force: true })
+  await fs.mkdir(extractDir, { recursive: true })
+
+  const script = await loadPsScript('printer-archive-extract', {
+    ARCHIVE_PATH: toPsSingleQuote(archivePath),
+    EXTRACT_PATH: toPsSingleQuote(extractDir),
+  })
+  await runPowerShell(script, { timeoutMs: 120_000 })
+  return {
+    extractDir,
+  }
+}
+
+async function safeCleanupExtractDir(extractDir) {
+  if (!extractDir) return
+  try {
+    await fs.rm(extractDir, { recursive: true, force: true })
+  } catch {}
 }
 
 function toPsSingleQuote(value) {
@@ -131,37 +265,47 @@ function getDefaultBackupDir() {
   return path.join(app.getPath('documents'), 'EleDrive', 'driver-backups')
 }
 
-function isVirtualPrinter(printer) {
+function normalizeVirtualPrinterConfig(raw = {}) {
+  const toLowerList = (value) => {
+    const list = Array.isArray(value) ? value : []
+    return [...new Set(list.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean))]
+  }
+
+  return {
+    keywords: toLowerList(raw?.keywords || DEFAULT_VIRTUAL_PRINTER_CONFIG.keywords),
+    exactPorts: toLowerList(raw?.exactPorts || raw?.ports?.exact || DEFAULT_VIRTUAL_PRINTER_CONFIG.exactPorts),
+    prefixPorts: toLowerList(raw?.prefixPorts || raw?.ports?.prefix || DEFAULT_VIRTUAL_PRINTER_CONFIG.prefixPorts),
+    containsPorts: toLowerList(raw?.containsPorts || raw?.ports?.contains || DEFAULT_VIRTUAL_PRINTER_CONFIG.containsPorts),
+  }
+}
+
+async function readVirtualPrinterConfig() {
+  try {
+    const fileText = await fs.readFile(getVirtualPrinterConfigPath(), 'utf-8')
+    return normalizeVirtualPrinterConfig(JSON.parse(fileText))
+  } catch {
+    return normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
+  }
+}
+
+function isVirtualPrinter(printer, virtualConfig = DEFAULT_VIRTUAL_PRINTER_CONFIG) {
   const name = String(printer?.name || '').toLowerCase()
   const driverName = String(printer?.driverName || '').toLowerCase()
   const portName = String(printer?.portName || '').toLowerCase()
 
-  const keywordPatterns = [
-    'pdf',
-    'xps',
-    'fax',
-    'onenote',
-    'virtual',
-    'document writer',
-    'microsoft print to pdf',
-    'microsoft xps document writer',
-    'adobe pdf',
-    'foxit pdf',
-    'wps pdf',
-    'doro pdf',
-    'cutepdf',
-    'priprinter',
-  ]
-
-  if (keywordPatterns.some((keyword) => name.includes(keyword) || driverName.includes(keyword))) {
+  if (virtualConfig.keywords.some((keyword) => name.includes(keyword) || driverName.includes(keyword))) {
     return true
   }
 
-  if (portName === 'file:' || portName === 'portprompt:' || portName === 'nul:') {
+  if (virtualConfig.exactPorts.includes(portName)) {
     return true
   }
 
-  if (portName.startsWith('redir') || portName.startsWith('ts') || portName.includes('prompt')) {
+  if (virtualConfig.prefixPorts.some((prefix) => portName.startsWith(prefix))) {
+    return true
+  }
+
+  if (virtualConfig.containsPorts.some((keyword) => portName.includes(keyword))) {
     return true
   }
 
@@ -224,13 +368,13 @@ function normalizeIndex(raw) {
         driverVersion: String(entry.driverVersion || ''),
         manufacturer: String(entry.manufacturer || ''),
         infRelativePath: String(entry.infRelativePath || ''),
-        backupSubDir: String(entry.backupSubDir || ''),
         backupAt: String(entry.backupAt || ''),
         portName: String(entry.portName || ''),
         portHostAddress: String(entry.portHostAddress || ''),
         portNumber: String(entry.portNumber || ''),
         environment: String(entry.environment || ''),
         ...normalizeIdentityFields(entry),
+        ...normalizeArchiveFields(entry),
       })),
   }
 }
@@ -267,6 +411,7 @@ async function scanBackupDirForIndex(backupDir) {
   }
 
   const entries = []
+  // Legacy folder-mode backup index rebuild fallback.
   for (const dirent of dirents) {
     if (!dirent.isDirectory()) continue
     const backupSubDir = dirent.name
@@ -283,13 +428,13 @@ async function scanBackupDirForIndex(backupDir) {
         driverVersion: String(meta.driverVersion || ''),
         manufacturer: String(meta.manufacturer || ''),
         infRelativePath: String(meta.infRelativePath || ''),
-        backupSubDir,
         backupAt: String(meta.backupAt || ''),
         portName: String(meta.portName || ''),
         portHostAddress: String(meta.portHostAddress || ''),
         portNumber: String(meta.portNumber || ''),
         environment: String(meta.environment || ''),
         ...normalizeIdentityFields(meta),
+        ...normalizeArchiveFields(meta),
       })
     } catch {
       // ignore invalid metadata file
@@ -430,6 +575,19 @@ async function normalizeInstalledDriverVersion(driver) {
   }
 }
 
+async function resolveBackupInfPathFromIndexEntry(backupDir, entry) {
+  const infRelativePath = String(entry?.infRelativePath || '').trim()
+  if (!infRelativePath) return ''
+  const candidates = [path.join(backupDir, infRelativePath)]
+  for (const candidate of candidates) {
+    try {
+      const stat = await fs.stat(candidate)
+      if (stat.isFile()) return candidate
+    } catch {}
+  }
+  return ''
+}
+
 async function normalizeIndexDriverVersions(backupDir, indexObj) {
   if (!indexObj?.entries?.length) return indexObj
   let changed = false
@@ -437,9 +595,7 @@ async function normalizeIndexDriverVersions(backupDir, indexObj) {
     indexObj.entries.map(async (entry) => {
       const needsNormalize = !entry.driverVersion || isRawDriverVersionValue(entry.driverVersion)
       if (!needsNormalize) return entry
-      const infPath = entry.infRelativePath
-        ? path.join(backupDir, entry.backupSubDir || '', entry.infRelativePath)
-        : ''
+      const infPath = await resolveBackupInfPathFromIndexEntry(backupDir, entry)
       const parsedInf = await readDriverVerFromInfFile(infPath)
       const nextVersion = normalizeDriverVersionDisplay(entry.driverVersion, parsedInf)
       if (nextVersion === entry.driverVersion) return entry
@@ -489,8 +645,9 @@ async function writeSettings(nextSettings) {
 async function getInstalledPrinters() {
   const script = await loadPsScript('printer-list-installed')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
+  const virtualPrinterConfig = await readVirtualPrinterConfig()
   const list = Array.isArray(data) ? data : data ? [data] : []
-  const filtered = list.filter((item) => !isVirtualPrinter(item))
+  const filtered = list.filter((item) => !isVirtualPrinter(item, virtualPrinterConfig))
   const normalized = await Promise.all(
     filtered.map(async (item) => ({
       ...item,
@@ -523,6 +680,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
   const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
   const backupPath = result.backupDir
   const infRelativePath = await findInfRelativePath(backupPath, path.basename(result.infPath || ''))
+  const archiveInfo = await createBackupArchive(backupPath, targetRoot)
 
   const metadata = {
     printerName: result.printerName,
@@ -542,37 +700,50 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     infRelativePath,
     backupAt: new Date().toISOString(),
     method: result.method,
+    ...archiveInfo,
+    extractPolicy: ARCHIVE_EXTRACT_POLICY_DEFAULT,
   }
 
   const backupInfPath = metadata.infRelativePath ? path.join(backupPath, metadata.infRelativePath) : ''
   const parsedBackupInf = await readDriverVerFromInfFile(backupInfPath)
   metadata.driverVersion = normalizeDriverVersionDisplay(result.driverVersion, parsedBackupInf)
 
-  await fs.writeFile(path.join(backupPath, BACKUP_META_FILE_NAME), JSON.stringify(metadata, null, 2), 'utf-8')
+  try {
+    await upsertIndexEntry(targetRoot, {
+      printerName: metadata.printerName,
+      driverName: metadata.driverName,
+      driverVersion: metadata.driverVersion,
+      manufacturer: metadata.manufacturer,
+      infRelativePath: metadata.infRelativePath,
+      backupAt: metadata.backupAt,
+      portName: metadata.portName,
+      portHostAddress: metadata.portHostAddress,
+      portNumber: metadata.portNumber,
+      environment: metadata.environment,
+      pnpDeviceId: metadata.pnpDeviceId,
+      hardwareIds: metadata.hardwareIds,
+      usbVid: metadata.usbVid,
+      usbPid: metadata.usbPid,
+      usbVidPid: metadata.usbVidPid,
+      deviceSerial: metadata.deviceSerial,
+      archiveFileName: metadata.archiveFileName,
+      archiveRelativePath: metadata.archiveRelativePath,
+      archiveSha256: metadata.archiveSha256,
+      archiveSize: metadata.archiveSize,
+      archiveFormat: metadata.archiveFormat,
+      extractPolicy: metadata.extractPolicy,
+    })
 
-  await upsertIndexEntry(targetRoot, {
-    printerName: metadata.printerName,
-    driverName: metadata.driverName,
-    driverVersion: metadata.driverVersion,
-    manufacturer: metadata.manufacturer,
-    infRelativePath: metadata.infRelativePath,
-    backupSubDir: path.basename(backupPath),
-    backupAt: metadata.backupAt,
-    portName: metadata.portName,
-    portHostAddress: metadata.portHostAddress,
-    portNumber: metadata.portNumber,
-    environment: metadata.environment,
-    pnpDeviceId: metadata.pnpDeviceId,
-    hardwareIds: metadata.hardwareIds,
-    usbVid: metadata.usbVid,
-    usbPid: metadata.usbPid,
-    usbVidPid: metadata.usbVidPid,
-    deviceSerial: metadata.deviceSerial,
-  })
-
-  return {
-    ...result,
-    ...metadata,
+    return {
+      ...result,
+      ...metadata,
+      backupDir: targetRoot,
+      archivePath: path.join(targetRoot, metadata.archiveRelativePath || metadata.archiveFileName || ''),
+    }
+  } finally {
+    if (String(backupPath || '').trim()) {
+      await fs.rm(backupPath, { recursive: true, force: true })
+    }
   }
 }
 
@@ -592,7 +763,38 @@ async function installPrinterFromBackup({
   const effectivePrinterName = String(targetPrinterName || '').trim() || entry.printerName
   const effectivePortHostAddress = String(portHostAddressOverride || '').trim() || String(entry.portHostAddress || '')
 
-  const backupPath = path.join(backupDir, entry.backupSubDir || '')
+  const archivePath = resolveEntryArchivePath(backupDir, entry)
+  if (!archivePath) {
+    throw createArchiveError('ARCHIVE_NOT_FOUND', `备份索引缺少压缩包路径：${entry.printerName}`)
+  }
+
+  let backupPath = ''
+  let extractDir = ''
+  let installSucceeded = false
+
+  const archiveExists = await isFileExists(archivePath)
+  if (!archiveExists) {
+    throw createArchiveError('ARCHIVE_NOT_FOUND', `驱动备份压缩包不存在：${archivePath}`)
+  }
+  const expectedHash = String(entry.archiveSha256 || '').trim().toLowerCase()
+  if (expectedHash) {
+    const actualHash = await computeFileSha256(archivePath)
+    if (actualHash !== expectedHash) {
+      throw createArchiveError('ARCHIVE_HASH_MISMATCH', `驱动备份压缩包哈希不匹配：${archivePath}`)
+    }
+  }
+  try {
+    const taskId = `install-${Date.now()}-${randomUUID().split('-')[0]}`
+    const extracted = await extractBackupArchive(archivePath, taskId)
+    extractDir = extracted.extractDir
+    backupPath = extractDir
+  } catch (error) {
+    throw createArchiveError(
+      'ARCHIVE_EXTRACT_FAILED',
+      `驱动备份压缩包解压失败：${archivePath}。${error?.message || error}.`,
+    )
+  }
+
   let infPath = path.join(backupPath, entry.infRelativePath || '')
   let infRelativePath = entry.infRelativePath || ''
   let validInfPath = false
@@ -605,7 +807,12 @@ async function installPrinterFromBackup({
   }
 
   if (!validInfPath) {
-    const fallbackInf = await findInfRelativePath(backupPath, path.basename(infRelativePath || ''))
+    let fallbackInf = ''
+    try {
+      fallbackInf = await findInfRelativePath(backupPath, path.basename(infRelativePath || ''))
+    } catch {
+      fallbackInf = ''
+    }
     if (fallbackInf) {
       infRelativePath = fallbackInf
       infPath = path.join(backupPath, fallbackInf)
@@ -628,7 +835,15 @@ async function installPrinterFromBackup({
     INF_PATH: toPsSingleQuote(infPath),
     BACKUP_PATH: toPsSingleQuote(backupPath),
   })
-  return runPowerShellJson(script, { timeoutMs: 120_000 })
+  try {
+    const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
+    installSucceeded = true
+    return result
+  } finally {
+    if (extractDir && installSucceeded) {
+      await safeCleanupExtractDir(extractDir)
+    }
+  }
 }
 
 async function pingHost(host) {
@@ -664,6 +879,123 @@ function getTrayIcon() {
   }
 
   return null
+}
+
+function getCustomProtocolPrefix() {
+  return `${CUSTOM_PROTOCOL_SCHEME}://`
+}
+
+function normalizeRoutePath(routePath = '') {
+  let text = String(routePath || '').trim()
+  if (!text) return '/'
+  if (text.startsWith('#')) {
+    text = text.slice(1)
+  }
+  if (!text.startsWith('/')) {
+    text = `/${text}`
+  }
+  text = text.replace(/\/{2,}/g, '/')
+
+  let queryText = ''
+  const queryIndex = text.indexOf('?')
+  if (queryIndex >= 0) {
+    queryText = text.slice(queryIndex + 1)
+    text = text.slice(0, queryIndex)
+  }
+  if (text.length > 1) {
+    text = text.replace(/\/+$/, '')
+  }
+  if (!KNOWN_ROUTE_PATHS.has(text)) {
+    text = '/'
+  }
+  return queryText ? `${text}?${queryText}` : text
+}
+
+function parseProtocolUrlToRoutePath(rawUrl = '') {
+  const value = String(rawUrl || '').trim()
+  if (!value || !value.toLowerCase().startsWith(getCustomProtocolPrefix())) {
+    return ''
+  }
+
+  let parsed = null
+  try {
+    parsed = new URL(value)
+  } catch {
+    return ''
+  }
+  if (String(parsed.protocol || '').toLowerCase() !== `${CUSTOM_PROTOCOL_SCHEME}:`) {
+    return ''
+  }
+
+  let routePath = String(parsed.searchParams.get('path') || parsed.searchParams.get('route') || '').trim()
+  if (!routePath) {
+    if (parsed.hash && parsed.hash.startsWith('#/')) {
+      routePath = parsed.hash.slice(1)
+    } else {
+      const host = decodeURIComponent(String(parsed.hostname || '').trim())
+      const pathname = decodeURIComponent(String(parsed.pathname || '').trim())
+      if (host && pathname && pathname !== '/') {
+        routePath = `/${host}${pathname}`
+      } else if (host) {
+        routePath = `/${host}`
+      } else {
+        routePath = pathname || '/'
+      }
+    }
+  }
+
+  const passthrough = new URLSearchParams(parsed.searchParams)
+  passthrough.delete('path')
+  passthrough.delete('route')
+  const normalized = normalizeRoutePath(routePath)
+  const hasQuery = normalized.includes('?')
+  const queryText = passthrough.toString()
+  if (!hasQuery && queryText) {
+    return `${normalized}?${queryText}`
+  }
+  return normalized
+}
+
+function findProtocolUrlFromArgv(argv = []) {
+  const prefix = getCustomProtocolPrefix()
+  const args = Array.isArray(argv) ? argv : []
+  return args.find((arg) => typeof arg === 'string' && arg.toLowerCase().startsWith(prefix)) || ''
+}
+
+function registerCustomProtocolClient() {
+  try {
+    if (process.defaultApp) {
+      const entryScript = process.argv[1] ? path.resolve(process.argv[1]) : ''
+      if (entryScript) {
+        app.setAsDefaultProtocolClient(CUSTOM_PROTOCOL_SCHEME, process.execPath, [entryScript])
+        return
+      }
+    }
+    app.setAsDefaultProtocolClient(CUSTOM_PROTOCOL_SCHEME)
+  } catch (error) {
+    console.warn(`[protocol] register failed: ${error?.message || error}`)
+  }
+}
+
+function openMainWindowByRoutePath(routePath = '/') {
+  const normalizedPath = normalizeRoutePath(routePath)
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.isLoadingMainFrame()) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    navigateMainWindow(normalizedPath)
+    return
+  }
+  showMainWindow(normalizedPath)
+}
+
+function handleProtocolOpen(rawUrl = '') {
+  const routePath = parseProtocolUrlToRoutePath(rawUrl)
+  if (!routePath) return false
+  if (app.isReady()) {
+    openMainWindowByRoutePath(routePath)
+  } else {
+    pendingProtocolRoutePath = routePath
+  }
+  return true
 }
 
 function navigateMainWindow(pathName = '/') {
@@ -744,7 +1076,7 @@ function createMainWindow() {
     title: APP_TITLE,
     autoHideMenuBar: true,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -796,10 +1128,19 @@ function createMainWindow() {
   return win
 }
 
+const startupProtocolUrl = findProtocolUrlFromArgv(process.argv)
+if (startupProtocolUrl) {
+  pendingProtocolRoutePath = parseProtocolUrlToRoutePath(startupProtocolUrl) || pendingProtocolRoutePath
+}
+
 if (!gotSingleInstanceLock) {
   app.quit()
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_, commandLine) => {
+    const protocolUrl = findProtocolUrlFromArgv(commandLine)
+    if (protocolUrl && handleProtocolOpen(protocolUrl)) {
+      return
+    }
     if (app.isReady()) {
       showMainWindow('/')
       return
@@ -807,7 +1148,14 @@ if (!gotSingleInstanceLock) {
     app.whenReady().then(() => showMainWindow('/'))
   })
 
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    handleProtocolOpen(url)
+  })
+
   app.whenReady().then(() => {
+    registerCustomProtocolClient()
+
     ipcMain.handle('app:get-version', () => app.getVersion())
 
     ipcMain.handle('settings:get', async () => readSettings())
@@ -834,6 +1182,22 @@ if (!gotSingleInstanceLock) {
         return null
       }
       return result.filePaths[0]
+    })
+    ipcMain.handle('settings:open-backup-dir', async () => {
+      const settings = await readSettings()
+      const backupDir = String(settings?.backupDir || '').trim()
+      if (!backupDir) {
+        throw new Error('备份目录未配置')
+      }
+      await fs.mkdir(backupDir, { recursive: true })
+      const openResult = await shell.openPath(backupDir)
+      if (openResult) {
+        throw new Error(openResult)
+      }
+      return {
+        path: backupDir,
+        opened: true,
+      }
     })
 
     ipcMain.handle('printers:list-installed', async () => getInstalledPrinters())
@@ -895,6 +1259,11 @@ if (!gotSingleInstanceLock) {
     createMainWindow()
     createTray()
     startPrinterStateWorker()
+    if (pendingProtocolRoutePath) {
+      const pendingPath = pendingProtocolRoutePath
+      pendingProtocolRoutePath = ''
+      openMainWindowByRoutePath(pendingPath)
+    }
 
     app.on('activate', () => {
       showMainWindow('/')

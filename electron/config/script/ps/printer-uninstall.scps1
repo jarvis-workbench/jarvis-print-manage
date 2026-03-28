@@ -208,8 +208,8 @@
     $portRemoved = $false
     $portRemoveError = ''
     if ($portName) {
-      if ($portName.Trim() -match '(?i)^USB') {
-        # Keep USB virtual ports to avoid removal errors and keep reinstall path stable.
+      if ($portName.Trim() -match '(?i)^(USB|DOT4)') {
+        # Keep USB-type ports (USB*/DOT4*) to avoid removal errors and keep reconnect/reinstall path stable.
         $portRemoved = $true
       } else {
         $portRefs = @(Get-Printer | Where-Object { $_.PortName -eq $portName }).Count

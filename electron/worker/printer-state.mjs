@@ -1,4 +1,5 @@
 ﻿import { parentPort, workerData } from 'node:worker_threads'
+import { loadPsScript } from '../config/script/ps/index.mjs'
 import { runPowerShellJson } from '../powershell.mjs'
 
 const pollIntervalMs = Math.max(Number(workerData?.pollIntervalMs) || 2000, 1000)
@@ -12,6 +13,7 @@ let lastState = {
   ports: [],
   spooler: 'unknown',
 }
+let runtimeStateScriptPromise = null
 
 function toBool(value) {
   if (value === true || value === false) return value
@@ -192,157 +194,15 @@ function diffState(prev, next) {
   }
 }
 
+async function getRuntimeStateScript() {
+  if (!runtimeStateScriptPromise) {
+    runtimeStateScriptPromise = loadPsScript('printer-runtime-state')
+  }
+  return runtimeStateScriptPromise
+}
+
 async function collectPrinterRuntimeState() {
-  const script = `
-    $ErrorActionPreference = 'Stop'
-    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
-    if ($spooler -and $spooler.Status -ne 'Running') {
-      try {
-        Start-Service -Name spooler -ErrorAction Stop
-        Start-Sleep -Milliseconds 700
-      } catch {}
-    }
-    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
-    if (-not $spooler -or $spooler.Status -ne 'Running') {
-      [PSCustomObject]@{
-        spooler = 'stopped'
-        printers = @()
-        ports = @()
-      } | ConvertTo-Json -Depth 6 -Compress
-      return
-    }
-
-    $wmiPrinterMap = @{}
-    foreach ($wmiPrinter in (Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue)) {
-      if ($wmiPrinter -and $wmiPrinter.Name) {
-        $wmiPrinterMap[$wmiPrinter.Name] = $wmiPrinter
-      }
-    }
-    $pnpEntityMap = @{}
-    foreach ($pnpEntity in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
-      if ($pnpEntity -and $pnpEntity.DeviceID) {
-        $pnpEntityMap[[string]$pnpEntity.DeviceID] = $pnpEntity
-      }
-    }
-    $presentPnpMap = @{}
-    if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-      foreach ($device in (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
-        if ($device -and $device.InstanceId) {
-          $presentPnpMap[[string]$device.InstanceId.ToLower()] = $true
-        }
-      }
-    }
-    $presentUsbPrinterNames = @()
-    if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-      foreach ($device in (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
-        $instanceId = [string]$device.InstanceId
-        if (-not $instanceId) { continue }
-        if ($instanceId -like 'USBPRINT\\*') {
-          $friendly = [string]$device.FriendlyName
-          if ($friendly) {
-            $presentUsbPrinterNames += $friendly.ToLower()
-          }
-        }
-      }
-    }
-
-    $printers = @(
-      Get-Printer -ErrorAction SilentlyContinue |
-      ForEach-Object {
-        $wmi = $null
-        if ($wmiPrinterMap.ContainsKey($_.Name)) {
-          $wmi = $wmiPrinterMap[$_.Name]
-        }
-        $resolvedWorkOffline = [bool]$_.WorkOffline
-        if ($wmi -and $wmi.WorkOffline -ne $null) {
-          $resolvedWorkOffline = $resolvedWorkOffline -or [bool]$wmi.WorkOffline
-        }
-        $portNameText = [string]$_.PortName
-        $isUsbPort = $portNameText -match '^(?i)(USB\\d*|DOT4\\d*)'
-        $wmiPnpId = if ($wmi) { [string]$wmi.PNPDeviceID } else { '' }
-        $hardwareIds = @()
-        if ($wmiPnpId -and $pnpEntityMap.ContainsKey($wmiPnpId)) {
-          $rawHardwareIds = @($pnpEntityMap[$wmiPnpId].HardwareID)
-          if ($rawHardwareIds) {
-            $hardwareIds = @($rawHardwareIds | ForEach-Object { [string]$_ } | Where-Object { $_ })
-          }
-        }
-        if (-not $hardwareIds -and $wmiPnpId) {
-          $hardwareIds = @($wmiPnpId)
-        }
-        $usbVid = ''
-        $usbPid = ''
-        $usbVidPid = ''
-        $deviceSerial = ''
-        if ($wmiPnpId -match '(?i)VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
-          $usbVid = $matches[1].ToUpper()
-          $usbPid = $matches[2].ToUpper()
-          $usbVidPid = ($usbVid + ':' + $usbPid)
-        }
-        if ($wmiPnpId -like 'USBPRINT\\*' -or $wmiPnpId -like 'USB\\VID_*') {
-          $parts = $wmiPnpId -split '\\\\'
-          if ($parts.Count -ge 3) {
-            $deviceSerial = [string]$parts[$parts.Count - 1]
-          }
-        }
-        $usbDisconnected = $false
-        if ($isUsbPort) {
-          # USB profiles are considered disconnected by default until a live device matches.
-          $usbDisconnected = $true
-          if ($wmiPnpId) {
-            $usbDisconnected = -not $presentPnpMap.ContainsKey($wmiPnpId.ToLower())
-          } else {
-            $printerNameLower = ([string]$_.Name).ToLower()
-            $driverNameLower = ([string]$_.DriverName).ToLower()
-            foreach ($presentName in $presentUsbPrinterNames) {
-              if (
-                $printerNameLower.Contains($presentName) -or
-                $presentName.Contains($printerNameLower) -or
-                $driverNameLower.Contains($presentName) -or
-                $presentName.Contains($driverNameLower)
-              ) {
-                $usbDisconnected = $false
-                break
-              }
-            }
-          }
-        }
-        [PSCustomObject]@{
-          Name = $_.Name
-          DriverName = $_.DriverName
-          PortName = $portNameText
-          PrinterStatus = $_.PrinterStatus
-          WorkOffline = $resolvedWorkOffline
-          UsbDisconnected = $usbDisconnected
-          Shared = $_.Shared
-          ShareName = $_.ShareName
-          QueueStatus = $_.QueueStatus
-          PnpDeviceId = $wmiPnpId
-          HardwareIds = $hardwareIds
-          UsbVid = $usbVid
-          UsbPid = $usbPid
-          UsbVidPid = $usbVidPid
-          DeviceSerial = $deviceSerial
-          WmiWorkOffline = if ($wmi) { [bool]$wmi.WorkOffline } else { $false }
-          WmiPrinterStatus = if ($wmi) { $wmi.PrinterStatus } else { $null }
-          WmiAvailability = if ($wmi) { $wmi.Availability } else { $null }
-          WmiPrinterState = if ($wmi) { $wmi.PrinterState } else { $null }
-          WmiExtendedPrinterStatus = if ($wmi) { $wmi.ExtendedPrinterStatus } else { $null }
-          WmiDetectedErrorState = if ($wmi) { $wmi.DetectedErrorState } else { $null }
-        }
-      }
-    )
-    $ports = @(
-      Get-PrinterPort -ErrorAction SilentlyContinue |
-        Select-Object Name, PrinterHostAddress, PortNumber
-    )
-    [PSCustomObject]@{
-      spooler = 'running'
-      printers = $printers
-      ports = $ports
-    } | ConvertTo-Json -Depth 8 -Compress
-  `
-
+  const script = await getRuntimeStateScript()
   const data = await runPowerShellJson(script, { timeoutMs: WORKER_POWERSHELL_TIMEOUT_MS })
   return {
     spooler: String(data?.spooler || 'unknown'),

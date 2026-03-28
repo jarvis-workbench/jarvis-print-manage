@@ -1,0 +1,14 @@
+
+    $ErrorActionPreference = 'Stop'
+    $archive = {{ARCHIVE_PATH}}
+    $dest = {{EXTRACT_PATH}}
+    if (-not (Test-Path -LiteralPath $archive)) {
+      throw "Archive not found: $archive"
+    }
+    if (Test-Path -LiteralPath $dest) {
+      Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $dest)
+

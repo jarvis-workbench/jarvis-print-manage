@@ -8,7 +8,10 @@
 - `printer-list-installed.scps1`：读取系统打印机与驱动列表（包含后台打印服务状态兜底）。
 - `printer-list-usb-ports.scps1`：读取系统 USB 虚拟打印端口列表（例如 `USB001`）。
 - `printer-backup-driver.scps1`：按打印机名导出/复制驱动文件并生成备份结果。
+- `printer-archive-create.scps1`：将驱动备份目录打包为压缩包。
+- `printer-archive-extract.scps1`：将驱动压缩包解压到临时目录。
 - `printer-install-from-backup.scps1`：基于备份索引安装驱动并按条件创建打印机。
+- `printer-runtime-state.scps1`：读取系统实时打印机状态（供 `printer-state` worker 轮询）。
 - `printer-ping-host.scps1`：检测目标 IP 是否可连通并返回结构化结果。
 - `printer-uninstall.scps1`：卸载打印机、驱动并尝试清理残留文件。
 

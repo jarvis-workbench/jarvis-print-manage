@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('eleDrive', {
   setBackupDir: (backupDir) => ipcRenderer.invoke('settings:set-backup-dir', backupDir),
   setThemeMode: (themeMode) => ipcRenderer.invoke('settings:set-theme-mode', themeMode),
   chooseBackupDir: () => ipcRenderer.invoke('settings:choose-backup-dir'),
+  openBackupDir: () => ipcRenderer.invoke('settings:open-backup-dir'),
   listInstalledPrinters: () => ipcRenderer.invoke('printers:list-installed'),
   listUsbPrinterPorts: () => ipcRenderer.invoke('printers:list-usb-ports'),
   getPrinterRuntimeState: () => ipcRenderer.invoke('printers:state:get'),

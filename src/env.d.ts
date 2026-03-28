@@ -36,6 +36,12 @@ interface DriverBackupResult {
   infPath?: string
   backupDir: string
   method: string
+  archiveFileName?: string
+  archiveRelativePath?: string
+  archiveSha256?: string
+  archiveSize?: number
+  archiveFormat?: string
+  extractPolicy?: 'cleanup-on-success' | 'keep-on-fail'
 }
 
 interface DriverIndexEntry {
@@ -44,12 +50,17 @@ interface DriverIndexEntry {
   driverVersion: string
   manufacturer: string
   infRelativePath: string
-  backupSubDir: string
   backupAt: string
   portName: string
   portHostAddress: string
   portNumber: string
   environment: string
+  archiveFileName: string
+  archiveRelativePath: string
+  archiveSha256: string
+  archiveSize: number
+  archiveFormat: 'pdrv.zip' | ''
+  extractPolicy: 'cleanup-on-success' | 'keep-on-fail'
 }
 
 interface PrinterRuntimeItem {
@@ -91,6 +102,10 @@ interface Window {
     setBackupDir: (backupDir: string) => Promise<EleDriveSettings>
     setThemeMode: (themeMode: ThemeMode) => Promise<EleDriveSettings>
     chooseBackupDir: () => Promise<string | null>
+    openBackupDir: () => Promise<{
+      path: string
+      opened: boolean
+    }>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
     listUsbPrinterPorts: () => Promise<string[]>
     getPrinterRuntimeState: () => Promise<PrinterRuntimeState>

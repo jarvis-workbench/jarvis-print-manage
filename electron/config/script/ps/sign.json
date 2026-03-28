@@ -1,22 +1,17 @@
 {
   "algorithm": "sha256",
   "appId": "cc.eu.iiot.hs.tool",
-  "generatedAt": "2026-03-27T18:55:59.574Z",
+  "generatedAt": "2026-03-28T11:29:35.180Z",
   "scripts": {
-    "printer-open-system-add-wizard": {
-      "file": "printer-open-system-add-wizard.scps1",
-      "hash": "601aadded988dfcea38028001922f562a59c69ea55d43fcdeafc7908e687e701",
-      "appHash": "2c7f57454d846d6e572ff983b94e41e9e64516d17cf70a3e2eca64879d7cef99"
+    "printer-archive-create": {
+      "file": "printer-archive-create.scps1",
+      "hash": "76244177b6bdc46601a03866992d4a72ebdde212f87f4277800aabef9bf51e78",
+      "appHash": "1564435d216795e04f9c22a5e67bd5441b562c5d217363e67704072eae0bac8a"
     },
-    "printer-list-installed": {
-      "file": "printer-list-installed.scps1",
-      "hash": "81db376e2313c49472912662a04537691ec75dad290402f89fa6982cc288ca66",
-      "appHash": "e303b1299bbf60bfe01ea5941e97028b5955c12886a6a3908f465e93c8cb995e"
-    },
-    "printer-list-usb-ports": {
-      "file": "printer-list-usb-ports.scps1",
-      "hash": "a7275e54a486124ebd6c4f1b0228a47b9758c3befa66bd67a557f551c066ac6a",
-      "appHash": "730c702a0bf96794db70dc5f891b72d7a421d0f39fbe12b3e3d49d820fa86396"
+    "printer-archive-extract": {
+      "file": "printer-archive-extract.scps1",
+      "hash": "f8651e501f253d32669dff792216089259f2b36ec1780c029213c0f80c6cb46f",
+      "appHash": "5d33d6484763633a9ee88d6a8a43a365875874581735bf93d005649bf00a3347"
     },
     "printer-backup-driver": {
       "file": "printer-backup-driver.scps1",
@@ -28,15 +23,35 @@
       "hash": "ba6c124a254cac8e2c6c4ea7ddb641216ce298be656dc447119309fe43b4fe63",
       "appHash": "b1cf8251d2fe0501b07d20476fc77e7fdf89bdeaecec3f82eed16137976b8042"
     },
+    "printer-list-installed": {
+      "file": "printer-list-installed.scps1",
+      "hash": "81db376e2313c49472912662a04537691ec75dad290402f89fa6982cc288ca66",
+      "appHash": "e303b1299bbf60bfe01ea5941e97028b5955c12886a6a3908f465e93c8cb995e"
+    },
+    "printer-list-usb-ports": {
+      "file": "printer-list-usb-ports.scps1",
+      "hash": "a7275e54a486124ebd6c4f1b0228a47b9758c3befa66bd67a557f551c066ac6a",
+      "appHash": "730c702a0bf96794db70dc5f891b72d7a421d0f39fbe12b3e3d49d820fa86396"
+    },
+    "printer-open-system-add-wizard": {
+      "file": "printer-open-system-add-wizard.scps1",
+      "hash": "601aadded988dfcea38028001922f562a59c69ea55d43fcdeafc7908e687e701",
+      "appHash": "2c7f57454d846d6e572ff983b94e41e9e64516d17cf70a3e2eca64879d7cef99"
+    },
     "printer-ping-host": {
       "file": "printer-ping-host.scps1",
       "hash": "bcaa42049e99e834c93ff29bf9742ef3101a578d81774bcdd08b5a48f086fa73",
       "appHash": "ef694b69ea0df269f41db6e73adb42c51d85ed06f438513c17fc182856d3e5a1"
     },
+    "printer-runtime-state": {
+      "file": "printer-runtime-state.scps1",
+      "hash": "a76214de1c8170397a4038d979db728b0d016ad2ea5ecae6309cfb189b948302",
+      "appHash": "fc32b1c8129564387e8c5d9dc8e325449dfd2e4a5eec8f7b06fbfb3626491ac8"
+    },
     "printer-uninstall": {
       "file": "printer-uninstall.scps1",
-      "hash": "c00d122a41cf66af6dd374c56d57be6f8af7e793498c2efa6d712547795f6954",
-      "appHash": "f93991c9500d855f4db0910aa9d2288b45e65c4c868a5444f612659736119f96"
+      "hash": "926c8a1080ba87804a09cc4b60c6c211e2b00dd895fb03e7b122d162501eb4d0",
+      "appHash": "bef096cd25cc89e88a9663403e0b0b5af1ee6d152ddd4e91ab84c68436c9e1b4"
     }
   }
 }

@@ -33,7 +33,7 @@ onUnmounted(() => {
 
 <template>
   <el-container class="shell">
-    <el-aside class="sidebar" width="190px">
+    <el-aside class="sidebar" width="172px">
       <div class="brand">虹色图文助手</div>
       <div class="brand-subtitle">图文行业-计算机一站式解决方案</div>
 

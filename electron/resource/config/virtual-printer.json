@@ -1,0 +1,30 @@
+{
+  "keywords": [
+    "pdf",
+    "xps",
+    "fax",
+    "onenote",
+    "virtual",
+    "document writer",
+    "microsoft print to pdf",
+    "microsoft xps document writer",
+    "adobe pdf",
+    "foxit pdf",
+    "wps pdf",
+    "doro pdf",
+    "cutepdf",
+    "priprinter"
+  ],
+  "exactPorts": [
+    "FILE:",
+    "PORTPROMPT:",
+    "NUL:"
+  ],
+  "prefixPorts": [
+    "redir",
+    "ts"
+  ],
+  "containsPorts": [
+    "prompt"
+  ]
+}
