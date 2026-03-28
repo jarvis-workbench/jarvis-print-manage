@@ -1,0 +1,16 @@
+$ErrorActionPreference = 'Stop'
+$printerName = {{PRINTER_NAME}}
+
+if (-not $printerName) {
+  throw 'Printer name is required.'
+}
+
+$escapedPrinterName = $printerName.Replace('"', '""')
+$args = "printui.dll,PrintUIEntry /p /n `"$escapedPrinterName`""
+Start-Process -FilePath 'rundll32.exe' -ArgumentList $args -WindowStyle Normal
+
+[PSCustomObject]@{
+  status = 'opened'
+  printerName = $printerName
+  dialog = 'properties'
+} | ConvertTo-Json -Compress

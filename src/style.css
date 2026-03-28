@@ -246,6 +246,28 @@ p {
   max-width: 100%;
 }
 
+.printer-table .el-table__header-wrapper th .cell {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.printer-table .el-table__body-wrapper td .cell {
+  font-size: 14px;
+}
+
+.printer-table .el-tag {
+  font-size: 13px;
+}
+
+.printer-table .el-table__header-wrapper th.operation-col .cell,
+.printer-table .el-table__body-wrapper td.operation-col .cell {
+  font-size: 12px;
+}
+
+.printer-tabs {
+  margin-top: 8px;
+}
+
 .printer-table .el-button {
   white-space: nowrap;
 }
@@ -255,19 +277,8 @@ p {
   justify-content: center;
   gap: 4px;
   flex-wrap: nowrap;
-  white-space: nowrap;
-  min-height: 34px;
+  min-height: 32px;
   align-items: center;
-}
-
-.action-slot {
-  width: 100%;
-  min-height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  flex-wrap: nowrap;
 }
 
 .action-row .el-dropdown {
@@ -279,7 +290,8 @@ p {
   align-items: center;
   gap: 4px;
   color: #247bff;
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 600;
   line-height: 1;
   text-decoration: underline;
   text-decoration-thickness: 1px;
@@ -295,6 +307,15 @@ p {
   color: #6fa7ff;
   pointer-events: none;
   cursor: wait;
+}
+
+.action-link-caret {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid currentColor;
+  transform: translateY(1px);
 }
 
 .action-link-spinner {
@@ -318,14 +339,14 @@ p {
 }
 
 .action-menu-item-label {
-  display: inline-block;
-  min-width: 88px;
-  border-radius: 4px;
-  padding: 2px 4px;
+  min-width: 112px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .action-menu-item-label.is-disabled {
-  color: var(--app-muted);
+  color: #8a93a3;
 }
 
 .printer-action-menu .el-dropdown-menu__item.is-disabled {
@@ -427,7 +448,7 @@ p {
 
 .cell-title {
   margin-top: 4px;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -446,7 +467,7 @@ p {
 }
 
 .cell-sub {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--app-muted);
   white-space: nowrap;
   overflow: hidden;

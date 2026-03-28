@@ -67,6 +67,22 @@ let printerRuntimeState = {
     removedPorts: [],
   },
 }
+let printerSnapshotState = {
+  updatedAt: '',
+  backupDir: '',
+  installedPrinters: [],
+  driverIndexEntries: [],
+}
+let printerSnapshotRefreshTimer = null
+let printerSnapshotRefreshRunning = false
+let printerSnapshotRefreshPending = false
+
+function upsertIpcHandler(channel, handler) {
+  try {
+    ipcMain.removeHandler(channel)
+  } catch {}
+  ipcMain.handle(channel, handler)
+}
 
 function broadcastPrinterState() {
   const payload = {
@@ -78,6 +94,21 @@ function broadcastPrinterState() {
   }
 }
 
+function broadcastPrinterSnapshot() {
+  const payload = {
+    ...printerSnapshotState,
+  }
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue
+    win.webContents.send('printers:snapshot-updated', payload)
+  }
+}
+
+function hasSnapshotRuntimeStructuralChanges(changes = {}) {
+  return ['addedPrinters', 'removedPrinters', 'addedPorts', 'removedPorts']
+    .some((key) => Array.isArray(changes?.[key]) && changes[key].length > 0)
+}
+
 function requestPrinterStateRefresh() {
   if (!printerStateWorker) return
   try {
@@ -86,6 +117,10 @@ function requestPrinterStateRefresh() {
 }
 
 function stopPrinterStateWorker() {
+  if (printerSnapshotRefreshTimer) {
+    clearTimeout(printerSnapshotRefreshTimer)
+    printerSnapshotRefreshTimer = null
+  }
   if (!printerStateWorker) return
   try {
     printerStateWorker.postMessage({ type: 'stop' })
@@ -113,6 +148,9 @@ function startPrinterStateWorker() {
         ...message.payload,
       }
       broadcastPrinterState()
+      if (hasSnapshotRuntimeStructuralChanges(message?.payload?.changes || {})) {
+        schedulePrinterSnapshotRefresh(800)
+      }
       return
     }
     if (type === 'error') {
@@ -258,6 +296,28 @@ function toPsSingleQuote(value) {
 
 async function openSystemAddPrinterWizard() {
   const script = await loadPsScript('printer-open-system-add-wizard')
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
+}
+
+async function openPrinterPropertiesDialog({ printerName }) {
+  const normalizedPrinterName = String(printerName || '').trim()
+  if (!normalizedPrinterName) {
+    throw new Error('Printer name is required.')
+  }
+  const script = await loadPsScript('printer-open-properties', {
+    PRINTER_NAME: toPsSingleQuote(normalizedPrinterName),
+  })
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
+}
+
+async function openPrinterPreferencesDialog({ printerName }) {
+  const normalizedPrinterName = String(printerName || '').trim()
+  if (!normalizedPrinterName) {
+    throw new Error('Printer name is required.')
+  }
+  const script = await loadPsScript('printer-open-preferences', {
+    PRINTER_NAME: toPsSingleQuote(normalizedPrinterName),
+  })
   return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
@@ -657,6 +717,56 @@ async function getInstalledPrinters() {
   return normalized
 }
 
+async function buildPrinterSnapshot() {
+  const settings = await readSettings()
+  const indexObj = await ensureBackupIndex(settings.backupDir)
+  const normalizedIndex = await normalizeIndexDriverVersions(settings.backupDir, indexObj)
+  const installedPrinters = await getInstalledPrinters()
+  return {
+    updatedAt: new Date().toISOString(),
+    backupDir: settings.backupDir,
+    installedPrinters,
+    driverIndexEntries: Array.isArray(normalizedIndex?.entries) ? normalizedIndex.entries : [],
+  }
+}
+
+async function refreshPrinterSnapshot({ broadcast = true } = {}) {
+  if (printerSnapshotRefreshRunning) {
+    printerSnapshotRefreshPending = true
+    return printerSnapshotState
+  }
+
+  printerSnapshotRefreshRunning = true
+  try {
+    const nextSnapshot = await buildPrinterSnapshot()
+    printerSnapshotState = nextSnapshot
+    if (broadcast) {
+      broadcastPrinterSnapshot()
+    }
+    return printerSnapshotState
+  } finally {
+    printerSnapshotRefreshRunning = false
+    if (printerSnapshotRefreshPending) {
+      printerSnapshotRefreshPending = false
+      void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
+        console.warn(`[printer-snapshot] refresh failed: ${error?.message || error}`)
+      })
+    }
+  }
+}
+
+function schedulePrinterSnapshotRefresh(delayMs = 900) {
+  if (printerSnapshotRefreshTimer) {
+    clearTimeout(printerSnapshotRefreshTimer)
+  }
+  printerSnapshotRefreshTimer = setTimeout(() => {
+    printerSnapshotRefreshTimer = null
+    void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
+      console.warn(`[printer-snapshot] scheduled refresh failed: ${error?.message || error}`)
+    })
+  }, Math.max(Number(delayMs) || 0, 0))
+}
+
 async function listUsbPrinterPorts() {
   const script = await loadPsScript('printer-list-usb-ports')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
@@ -862,6 +972,61 @@ async function uninstallPrinter({ printerName }) {
     PRINTER_NAME: toPsSingleQuote(printerName),
   })
   return runPowerShellJson(script, { timeoutMs: 120_000 })
+}
+
+async function printPrinterTestPage({ printerName }) {
+  const normalizedPrinterName = String(printerName || '').trim()
+  if (!normalizedPrinterName) {
+    throw new Error('Printer name is required.')
+  }
+  const script = await loadPsScript('printer-print-test-page', {
+    PRINTER_NAME: toPsSingleQuote(normalizedPrinterName),
+  })
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
+}
+
+async function deleteBackupDriver({ printerName, backupDir }) {
+  const targetPrinterName = String(printerName || '').trim()
+  if (!targetPrinterName) {
+    throw new Error('Printer name is required.')
+  }
+  const targetRoot = backupDir || getDefaultBackupDir()
+  const indexObj = await ensureBackupIndex(targetRoot)
+  const targetKey = targetPrinterName.toLowerCase()
+  const removedIndex = indexObj.entries.findIndex((entry) => String(entry?.printerName || '').trim().toLowerCase() === targetKey)
+  if (removedIndex < 0) {
+    throw new Error(`No backup index entry found for printer: ${targetPrinterName}`)
+  }
+
+  const removedEntry = indexObj.entries[removedIndex]
+  const nextEntries = indexObj.entries.filter((_, index) => index !== removedIndex)
+  await writeIndexFile(targetRoot, {
+    ...indexObj,
+    entries: nextEntries,
+  })
+
+  const archiveInfo = normalizeArchiveFields(removedEntry)
+  const archiveRel = String(archiveInfo.archiveRelativePath || archiveInfo.archiveFileName || '').trim()
+  let archiveDeleted = false
+  if (archiveRel) {
+    const archiveInUse = nextEntries.some((entry) => {
+      const nextArchive = normalizeArchiveFields(entry)
+      const nextArchiveRel = String(nextArchive.archiveRelativePath || nextArchive.archiveFileName || '').trim()
+      return nextArchiveRel && nextArchiveRel.toLowerCase() === archiveRel.toLowerCase()
+    })
+    if (!archiveInUse) {
+      const archivePath = path.join(targetRoot, archiveRel)
+      await fs.rm(archivePath, { force: true })
+      archiveDeleted = true
+    }
+  }
+
+  return {
+    status: 'deleted',
+    printerName: removedEntry.printerName,
+    archiveRelativePath: archiveRel,
+    archiveDeleted,
+  }
 }
 
 function getTrayIcon() {
@@ -1156,24 +1321,25 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(() => {
     registerCustomProtocolClient()
 
-    ipcMain.handle('app:get-version', () => app.getVersion())
+    upsertIpcHandler('app:get-version', () => app.getVersion())
 
-    ipcMain.handle('settings:get', async () => readSettings())
-    ipcMain.handle('settings:set-backup-dir', async (_, backupDir) => {
+    upsertIpcHandler('settings:get', async () => readSettings())
+    upsertIpcHandler('settings:set-backup-dir', async (_, backupDir) => {
       if (!backupDir || typeof backupDir !== 'string') {
         throw new Error('Invalid backup directory path.')
       }
       const saved = await writeSettings({ backupDir })
       await ensureBackupIndex(saved.backupDir)
+      await refreshPrinterSnapshot({ broadcast: true })
       return saved
     })
-    ipcMain.handle('settings:set-theme-mode', async (_, themeMode) => {
+    upsertIpcHandler('settings:set-theme-mode', async (_, themeMode) => {
       if (!THEME_MODES.has(themeMode)) {
         throw new Error('Invalid theme mode.')
       }
       return writeSettings({ themeMode })
     })
-    ipcMain.handle('settings:choose-backup-dir', async () => {
+    upsertIpcHandler('settings:choose-backup-dir', async () => {
       const result = await dialog.showOpenDialog({
         title: '选择打印机驱动备份目录',
         properties: ['openDirectory', 'createDirectory'],
@@ -1183,7 +1349,7 @@ if (!gotSingleInstanceLock) {
       }
       return result.filePaths[0]
     })
-    ipcMain.handle('settings:open-backup-dir', async () => {
+    upsertIpcHandler('settings:open-backup-dir', async () => {
       const settings = await readSettings()
       const backupDir = String(settings?.backupDir || '').trim()
       if (!backupDir) {
@@ -1200,21 +1366,47 @@ if (!gotSingleInstanceLock) {
       }
     })
 
-    ipcMain.handle('printers:list-installed', async () => getInstalledPrinters())
-    ipcMain.handle('printers:list-usb-ports', async () => listUsbPrinterPorts())
-    ipcMain.handle('printers:state:get', async () => ({ ...printerRuntimeState }))
-    ipcMain.handle('printers:open-system-add-wizard', async () => openSystemAddPrinterWizard())
-    ipcMain.handle('printers:backup-driver', async (_, payload) => {
+    upsertIpcHandler('printers:list-installed', async () => getInstalledPrinters())
+    upsertIpcHandler('printers:snapshot:get', async () => {
+      if (!printerSnapshotState.updatedAt) {
+        await refreshPrinterSnapshot({ broadcast: false })
+      }
+      return {
+        ...printerSnapshotState,
+      }
+    })
+    upsertIpcHandler('printers:list-usb-ports', async () => listUsbPrinterPorts())
+    upsertIpcHandler('printers:state:get', async () => ({ ...printerRuntimeState }))
+    upsertIpcHandler('printers:open-system-add-wizard', async () => openSystemAddPrinterWizard())
+    upsertIpcHandler('printers:open-properties', async (_, payload) => {
+      if (!payload?.printerName || typeof payload.printerName !== 'string') {
+        throw new Error('Invalid printer name.')
+      }
+      return openPrinterPropertiesDialog({
+        printerName: payload.printerName,
+      })
+    })
+    upsertIpcHandler('printers:open-preferences', async (_, payload) => {
+      if (!payload?.printerName || typeof payload.printerName !== 'string') {
+        throw new Error('Invalid printer name.')
+      }
+      return openPrinterPreferencesDialog({
+        printerName: payload.printerName,
+      })
+    })
+    upsertIpcHandler('printers:backup-driver', async (_, payload) => {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
         throw new Error('Invalid printer name.')
       }
       const settings = await readSettings()
-      return backupPrinterDriver({
+      const result = await backupPrinterDriver({
         printerName: payload.printerName,
         backupDir: payload.backupDir || settings.backupDir,
       })
+      await refreshPrinterSnapshot({ broadcast: true })
+      return result
     })
-    ipcMain.handle('printers:install', async (_, payload) => {
+    upsertIpcHandler('printers:install', async (_, payload) => {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
         throw new Error('Invalid printer name.')
       }
@@ -1226,16 +1418,17 @@ if (!gotSingleInstanceLock) {
         portHostAddressOverride: payload.portHostAddressOverride || '',
       })
       requestPrinterStateRefresh()
+      await refreshPrinterSnapshot({ broadcast: true })
       return result
     })
-    ipcMain.handle('printers:ping-host', async (_, payload) => {
+    upsertIpcHandler('printers:ping-host', async (_, payload) => {
       const host = String(payload?.host || '').trim()
       if (!host) {
         throw new Error('Invalid host.')
       }
       return pingHost(host)
     })
-    ipcMain.handle('printers:uninstall', async (_, payload) => {
+    upsertIpcHandler('printers:uninstall', async (_, payload) => {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
         throw new Error('Invalid printer name.')
       }
@@ -1243,22 +1436,50 @@ if (!gotSingleInstanceLock) {
         printerName: payload.printerName,
       })
       requestPrinterStateRefresh()
+      await refreshPrinterSnapshot({ broadcast: true })
+      return result
+    })
+    upsertIpcHandler('printers:print-test-page', async (_, payload) => {
+      if (!payload?.printerName || typeof payload.printerName !== 'string') {
+        throw new Error('Invalid printer name.')
+      }
+      return printPrinterTestPage({
+        printerName: payload.printerName,
+      })
+    })
+    upsertIpcHandler('printers:backup-delete', async (_, payload) => {
+      if (!payload?.printerName || typeof payload.printerName !== 'string') {
+        throw new Error('Invalid printer name.')
+      }
+      const settings = await readSettings()
+      const result = await deleteBackupDriver({
+        printerName: payload.printerName,
+        backupDir: settings.backupDir,
+      })
+      await refreshPrinterSnapshot({ broadcast: true })
       return result
     })
 
-    ipcMain.handle('drivers:index:get', async () => {
-      const settings = await readSettings()
-      const indexObj = await ensureBackupIndex(settings.backupDir)
-      const normalizedIndex = await normalizeIndexDriverVersions(settings.backupDir, indexObj)
+    upsertIpcHandler('drivers:index:get', async () => {
+      if (!printerSnapshotState.updatedAt) {
+        await refreshPrinterSnapshot({ broadcast: false })
+      }
       return {
-        backupDir: settings.backupDir,
-        index: normalizedIndex,
+        backupDir: printerSnapshotState.backupDir,
+        index: {
+          version: 1,
+          updatedAt: printerSnapshotState.updatedAt,
+          entries: printerSnapshotState.driverIndexEntries,
+        },
       }
     })
 
     createMainWindow()
     createTray()
     startPrinterStateWorker()
+    void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
+      console.warn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
+    })
     if (pendingProtocolRoutePath) {
       const pendingPath = pendingProtocolRoutePath
       pendingProtocolRoutePath = ''

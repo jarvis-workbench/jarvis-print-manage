@@ -38,10 +38,25 @@
       "hash": "601aadded988dfcea38028001922f562a59c69ea55d43fcdeafc7908e687e701",
       "appHash": "2c7f57454d846d6e572ff983b94e41e9e64516d17cf70a3e2eca64879d7cef99"
     },
+    "printer-open-properties": {
+      "file": "printer-open-properties.scps1",
+      "hash": "baa18da5a44223ae99ff9339bc0075497bdf5e79e46b611bc2a34b16d2f136ef",
+      "appHash": "fb45e72a64a5f82d8a20d600695260f1292825cc422c1a93a209edc4844d162c"
+    },
+    "printer-open-preferences": {
+      "file": "printer-open-preferences.scps1",
+      "hash": "4216879c0b404827ea6ee724a5c1463698877670270ecac13681f3aa1b153ff7",
+      "appHash": "aaa144f3eda1ab41f2e80a4b7c2916a291d797f832679905c8339af3afd01297"
+    },
     "printer-ping-host": {
       "file": "printer-ping-host.scps1",
       "hash": "bcaa42049e99e834c93ff29bf9742ef3101a578d81774bcdd08b5a48f086fa73",
       "appHash": "ef694b69ea0df269f41db6e73adb42c51d85ed06f438513c17fc182856d3e5a1"
+    },
+    "printer-print-test-page": {
+      "file": "printer-print-test-page.scps1",
+      "hash": "61c2b3934d4ddf5242146fdb0de93e2ae849802ccffea0b91b7b9f5e35d59fc6",
+      "appHash": "338a087ef52b36d625b1f1d4806db8a776d769a722c4e6a0ccd5bc8bef7eaf61"
     },
     "printer-runtime-state": {
       "file": "printer-runtime-state.scps1",

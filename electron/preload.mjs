@@ -8,13 +8,18 @@ contextBridge.exposeInMainWorld('eleDrive', {
   chooseBackupDir: () => ipcRenderer.invoke('settings:choose-backup-dir'),
   openBackupDir: () => ipcRenderer.invoke('settings:open-backup-dir'),
   listInstalledPrinters: () => ipcRenderer.invoke('printers:list-installed'),
+  getPrinterSnapshot: () => ipcRenderer.invoke('printers:snapshot:get'),
   listUsbPrinterPorts: () => ipcRenderer.invoke('printers:list-usb-ports'),
   getPrinterRuntimeState: () => ipcRenderer.invoke('printers:state:get'),
   openSystemAddPrinterWizard: () => ipcRenderer.invoke('printers:open-system-add-wizard'),
+  openPrinterProperties: (payload) => ipcRenderer.invoke('printers:open-properties', payload),
+  openPrinterPreferences: (payload) => ipcRenderer.invoke('printers:open-preferences', payload),
   backupPrinterDriver: (payload) => ipcRenderer.invoke('printers:backup-driver', payload),
   installPrinter: (payload) => ipcRenderer.invoke('printers:install', payload),
   pingHost: (payload) => ipcRenderer.invoke('printers:ping-host', payload),
   uninstallPrinter: (payload) => ipcRenderer.invoke('printers:uninstall', payload),
+  printTestPage: (payload) => ipcRenderer.invoke('printers:print-test-page', payload),
+  deleteBackupDriver: (payload) => ipcRenderer.invoke('printers:backup-delete', payload),
   getDriverIndex: () => ipcRenderer.invoke('drivers:index:get'),
   onTrayNavigate: (handler) => {
     if (typeof handler !== 'function') return () => {}
@@ -27,5 +32,11 @@ contextBridge.exposeInMainWorld('eleDrive', {
     const listener = (_, payload) => handler(payload)
     ipcRenderer.on('printers:state-updated', listener)
     return () => ipcRenderer.removeListener('printers:state-updated', listener)
+  },
+  onPrinterSnapshotUpdated: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('printers:snapshot-updated', listener)
+    return () => ipcRenderer.removeListener('printers:snapshot-updated', listener)
   },
 })

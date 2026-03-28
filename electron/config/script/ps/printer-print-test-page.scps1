@@ -1,0 +1,26 @@
+$ErrorActionPreference = 'Stop'
+$printerName = {{PRINTER_NAME}}
+
+$printer = Get-WmiObject -Class Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -eq $printerName
+} | Select-Object -First 1
+
+if (-not $printer) {
+  throw "Printer not found: $printerName"
+}
+
+$result = $printer.PrintTestPage()
+$returnValue = $null
+if ($null -ne $result) {
+  $returnValue = $result.ReturnValue
+}
+
+if ($null -ne $returnValue -and [int]$returnValue -ne 0) {
+  throw "PrintTestPage failed with code: $returnValue"
+}
+
+[PSCustomObject]@{
+  status = 'queued'
+  printerName = $printerName
+  returnValue = $returnValue
+} | ConvertTo-Json -Compress

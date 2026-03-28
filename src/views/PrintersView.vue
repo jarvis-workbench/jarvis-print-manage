@@ -8,6 +8,10 @@ import { useRuntimeStore } from '../stores/runtime'
 const loading = ref(false)
 const savingAction = ref('')
 const backingUpNames = ref(new Set())
+const printingTestNames = ref(new Set())
+const deletingBackupNames = ref(new Set())
+const openingPropertiesNames = ref(new Set())
+const openingPreferencesNames = ref(new Set())
 const uninstalling = ref(false)
 const installWizardVisible = ref(false)
 const installWizardSubmitting = ref(false)
@@ -30,18 +34,23 @@ const runtimeStore = useRuntimeStore()
 const { settings, PrinterServerManage } = storeToRefs(runtimeStore)
 const waitingUsbReconnectNames = ref(new Set())
 let removePrinterStateUpdatedListener = null
+let removePrinterSnapshotUpdatedListener = null
 let loadPrintersSeq = 0
 let loadingOwnerSeq = 0
-let cachedInstalledPrinters = []
-let cachedDriverIndexEntries = []
-let cachedBackupDir = ''
-let initialSnapshotLoaded = false
-let silentReloadTimer = null
 const installSuppressedUntil = ref(new Map())
+const activePrinterTab = ref('installed')
 
-const rows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
-
-const totalPrinters = computed(() => rows.value.length)
+const allRows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
+const installedRows = computed(() => allRows.value.filter((item) => item?.installed))
+const localDriverRows = computed(() => allRows.value.filter((item) => item?.backup))
+const networkDriverRows = computed(() => [])
+const totalPrinters = computed(() => {
+  const tab = String(activePrinterTab.value || 'installed')
+  if (tab === 'installed') return installedRows.value.length
+  if (tab === 'local-driver') return localDriverRows.value.length
+  if (tab === 'network-driver') return networkDriverRows.value.length
+  return 0
+})
 const installWizardNeedsIpStep = computed(() => isIpPortProfile(installWizardRow.value))
 const installWizardBusy = computed(() => installWizardSubmitting.value || installWizardIpChecking.value || installWizardAdvancing.value)
 const installFlowActive = computed(() => installWizardVisible.value || installWizardBusy.value || savingAction.value.startsWith('install:'))
@@ -72,6 +81,62 @@ function markBackingUp(printerName, loading) {
 function isBackingUp(row) {
   const key = normalizePrinterKey(row?.printerName)
   return key ? backingUpNames.value.has(key) : false
+}
+
+function markPrintingTest(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(printingTestNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  printingTestNames.value = next
+}
+
+function isPrintingTest(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? printingTestNames.value.has(key) : false
+}
+
+function markDeletingBackup(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(deletingBackupNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  deletingBackupNames.value = next
+}
+
+function isDeletingBackup(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? deletingBackupNames.value.has(key) : false
+}
+
+function markOpeningProperties(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(openingPropertiesNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  openingPropertiesNames.value = next
+}
+
+function isOpeningProperties(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? openingPropertiesNames.value.has(key) : false
+}
+
+function markOpeningPreferences(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(openingPreferencesNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  openingPreferencesNames.value = next
+}
+
+function isOpeningPreferences(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? openingPreferencesNames.value.has(key) : false
 }
 
 function parseIpCandidate(rawValue) {
@@ -185,36 +250,8 @@ function reconcileWaitingUsbReconnectState(printers) {
   waitingUsbReconnectNames.value = next
 }
 
-function canBackup(row) {
-  return row.installed && !row.backup
-}
-
 function showWaitingUsbHint(row) {
   return hasWaitingUsbReconnect(row)
-}
-
-function canInstall(row) {
-  return !row.installed && row.backup && !showWaitingUsbHint(row) && !isInstallSuppressed(row)
-}
-
-function canUninstall(row) {
-  return row.installed && !showWaitingUsbHint(row)
-}
-
-function shouldShowWaiting(row) {
-  return showWaitingUsbHint(row)
-}
-
-function shouldShowBackup(row) {
-  return !shouldShowWaiting(row) && canBackup(row)
-}
-
-function shouldShowInstall(row) {
-  return !shouldShowWaiting(row) && canInstall(row)
-}
-
-function shouldShowUninstall(row) {
-  return !shouldShowWaiting(row) && canUninstall(row)
 }
 
 function getBackupDisableReason(row) {
@@ -255,51 +292,148 @@ function getOpenBackupDirDisableReason() {
   return ''
 }
 
-function getActionMenuItems(row) {
-  const backupReason = getBackupDisableReason(row)
-  const installReason = getInstallDisableReason(row)
-  const uninstallReason = getUninstallDisableReason(row)
-  const openDirReason = getOpenBackupDirDisableReason()
+function getPrintTestDisableReason(row) {
+  if (isPrintingTest(row)) return '正在发送测试页'
+  if (installFlowActive.value) return '正在安装，请稍后'
+  if (uninstalling.value) return '正在卸载，请稍后'
+  if (showWaitingUsbHint(row)) return '等待打印机USB重新接入'
+  if (!row?.installed) return '打印机未安装'
+  return ''
+}
 
-  return [
-    {
-      command: 'backup',
-      label: '备份',
-      disabled: Boolean(backupReason),
-      reason: backupReason,
-    },
-    {
-      command: 'install',
-      label: '安装',
-      disabled: Boolean(installReason),
-      reason: installReason,
-    },
-    {
+function getOpenInstalledPrinterDialogDisableReason(row) {
+  if (isOpeningProperties(row) || isOpeningPreferences(row)) return '正在打开，请稍后'
+  if (installFlowActive.value) return '正在安装，请稍后'
+  if (uninstalling.value) return '正在卸载，请稍后'
+  if (showWaitingUsbHint(row)) return '等待打印机USB重新接入'
+  if (!row?.installed) return '打印机未安装'
+  return ''
+}
+
+function getDeleteBackupDisableReason(row) {
+  if (isDeletingBackup(row)) return '正在删除备份'
+  if (isBackingUp(row)) return '当前打印机正在备份'
+  if (backupFlowActive.value) return '正在备份，请稍后'
+  if (installFlowActive.value) return '正在安装，请稍后'
+  if (uninstalling.value) return '正在卸载，请稍后'
+  if (!row?.backup) return '当前无备份可删除'
+  return ''
+}
+
+function isOpeningBackupDir(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return openingBackupDir.value && key && openingBackupDirPrinterKey.value === key
+}
+
+function getInlineActionItems(row, tabName = activePrinterTab.value) {
+  const tab = String(tabName || 'installed')
+  const actions = []
+
+  if (tab === 'installed') {
+    const printReason = getPrintTestDisableReason(row)
+    const openDialogReason = getOpenInstalledPrinterDialogDisableReason(row)
+    const uninstallReason = getUninstallDisableReason(row)
+    actions.push({
+      command: 'print-test-page',
+      label: '打印测试页',
+      disabled: Boolean(printReason),
+      reason: printReason,
+      loading: isPrintingTest(row),
+      loadingLabel: '正在发送',
+    })
+    actions.push({
+      command: 'open-printer-properties',
+      label: '打印机属性',
+      disabled: Boolean(openDialogReason),
+      reason: openDialogReason,
+      loading: isOpeningProperties(row),
+      loadingLabel: '正在打开',
+    })
+    actions.push({
+      command: 'open-printer-preferences',
+      label: '打印机首选项',
+      disabled: Boolean(openDialogReason),
+      reason: openDialogReason,
+      loading: isOpeningPreferences(row),
+      loadingLabel: '正在打开',
+    })
+    actions.push({
       command: 'uninstall',
       label: '卸载',
       disabled: Boolean(uninstallReason),
       reason: uninstallReason,
-    },
-    {
+      loading: savingAction.value === `uninstall:${row?.printerName || ''}`,
+      loadingLabel: '正在卸载',
+    })
+    if (row?.backup) {
+      const openReason = getOpenBackupDirDisableReason()
+      actions.push({
+        command: 'open-backup-dir',
+        label: '打开备份目录',
+        disabled: Boolean(openReason),
+        reason: openReason,
+        loading: isOpeningBackupDir(row),
+        loadingLabel: '正在打开',
+      })
+    } else {
+      const backupReason = getBackupDisableReason(row)
+      actions.push({
+        command: 'backup',
+        label: '备份',
+        disabled: Boolean(backupReason),
+        reason: backupReason,
+        loading: isBackingUp(row),
+        loadingLabel: '正在备份',
+      })
+    }
+    return actions
+  }
+
+  if (tab === 'local-driver') {
+    const deleteBackupReason = getDeleteBackupDisableReason(row)
+    const openReason = row?.backup ? getOpenBackupDirDisableReason() : '当前无备份可打开'
+    if (!row?.installed) {
+      const installReason = getInstallDisableReason(row)
+      actions.push({
+        command: 'install',
+        label: '安装',
+        disabled: Boolean(installReason),
+        reason: installReason,
+        loading: savingAction.value === `install:${row?.printerName || ''}`,
+        loadingLabel: '正在安装',
+      })
+    }
+    actions.push({
+      command: 'delete-backup',
+      label: '删除备份',
+      disabled: Boolean(deleteBackupReason),
+      reason: deleteBackupReason,
+      loading: isDeletingBackup(row),
+      loadingLabel: '正在删除',
+    })
+    actions.push({
       command: 'open-backup-dir',
       label: '打开备份目录',
-      disabled: Boolean(openDirReason),
-      reason: openDirReason,
-    },
-  ]
-}
+      disabled: Boolean(openReason),
+      reason: openReason,
+      loading: isOpeningBackupDir(row),
+      loadingLabel: '正在打开',
+    })
+    return actions
+  }
 
-function isActionButtonLoading(row) {
-  return getActionTriggerState(row).busy
+  return actions
 }
 
 function getActionTriggerState(row) {
   const name = String(row?.printerName || '')
-  const key = normalizePrinterKey(row?.printerName)
+  if (isOpeningProperties(row) || isOpeningPreferences(row)) return { busy: true, label: '正在打开' }
+  if (isPrintingTest(row)) return { busy: true, label: '正在发送' }
   if (isBackingUp(row)) return { busy: true, label: '正在备份' }
   if (savingAction.value === `install:${name}`) return { busy: true, label: '正在安装' }
   if (savingAction.value === `uninstall:${name}`) return { busy: true, label: '正在卸载' }
-  if (openingBackupDir.value && key && openingBackupDirPrinterKey.value === key) return { busy: true, label: '正在打开' }
+  if (isDeletingBackup(row)) return { busy: true, label: '正在删除' }
+  if (isOpeningBackupDir(row)) return { busy: true, label: '正在打开' }
   return { busy: false, label: '操作' }
 }
 
@@ -320,13 +454,96 @@ async function openBackupDirectory(row) {
   }
 }
 
-function handleActionCommand(command, row) {
+async function printTestPage(row) {
+  if (!window.eleDrive?.printTestPage) return
+  markPrintingTest(row?.printerName, true)
+  try {
+    await window.eleDrive.printTestPage({ printerName: row.printerName })
+    ElMessage.success('测试页任务已发送')
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`发送测试页失败：${detail}`)
+  } finally {
+    markPrintingTest(row?.printerName, false)
+  }
+}
+
+async function openInstalledPrinterProperties(row) {
+  if (!window.eleDrive?.openPrinterProperties) return
+  markOpeningProperties(row?.printerName, true)
+  try {
+    await window.eleDrive.openPrinterProperties({ printerName: row.printerName })
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`打开打印机属性失败：${detail}`)
+  } finally {
+    markOpeningProperties(row?.printerName, false)
+  }
+}
+
+async function openInstalledPrinterPreferences(row) {
+  if (!window.eleDrive?.openPrinterPreferences) return
+  markOpeningPreferences(row?.printerName, true)
+  try {
+    await window.eleDrive.openPrinterPreferences({ printerName: row.printerName })
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`打开打印机首选项失败：${detail}`)
+  } finally {
+    markOpeningPreferences(row?.printerName, false)
+  }
+}
+
+async function deleteBackup(row) {
+  if (!window.eleDrive?.deleteBackupDriver) return
+  const targetName = String(row?.backupPrinterName || row?.printerName || '').trim()
+  if (!targetName) return
+
+  try {
+    await ElMessageBox.confirm(`确认删除“${targetName}”的备份？`, '删除备份', {
+      confirmButtonText: '确认删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+
+  markDeletingBackup(targetName, true)
+  try {
+    await window.eleDrive.deleteBackupDriver({ printerName: targetName })
+    ElMessage.success('备份已删除')
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`删除备份失败：${detail}`)
+  } finally {
+    markDeletingBackup(targetName, false)
+  }
+}
+
+function handleInlineAction(command, row, tabName = activePrinterTab.value) {
   if (!row) return
   const cmd = String(command || '')
-  const actions = getActionMenuItems(row)
+  const actions = getInlineActionItems(row, tabName)
   const selected = actions.find((item) => item.command === cmd)
   if (!selected || selected.disabled) return
 
+  if (cmd === 'print-test-page') {
+    void printTestPage(row)
+    return
+  }
+  if (cmd === 'open-printer-properties') {
+    void openInstalledPrinterProperties(row)
+    return
+  }
+  if (cmd === 'open-printer-preferences') {
+    void openInstalledPrinterPreferences(row)
+    return
+  }
   if (cmd === 'backup') {
     void backupDriver(row)
     return
@@ -341,17 +558,27 @@ function handleActionCommand(command, row) {
   }
   if (cmd === 'open-backup-dir') {
     void openBackupDirectory(row)
+    return
+  }
+  if (cmd === 'delete-backup') {
+    void deleteBackup(row)
   }
 }
 
 function driverStatusType(row) {
-  if (!row?.installed) return 'info'
   return row?.backup ? 'success' : 'warning'
 }
 
 function driverStatusText(row) {
-  if (!row?.installed) return '未安装'
   return row?.backup ? '已备份' : '未备份'
+}
+
+function installStateType(row) {
+  return row?.installed ? 'success' : 'info'
+}
+
+function installStateText(row) {
+  return row?.installed ? '已安装' : '未安装'
 }
 
 function infDisplayText(row) {
@@ -404,98 +631,71 @@ function printerAvailabilityType(row) {
   return 'info'
 }
 
+function applyPrinterSnapshot(payload) {
+  if (!payload) return
+  runtimeStore.setPrinterSnapshot({
+    installedPrinters: Array.isArray(payload?.installedPrinters) ? payload.installedPrinters : [],
+    driverIndexEntries: Array.isArray(payload?.driverIndexEntries) ? payload.driverIndexEntries : [],
+    backupDir: String(payload?.backupDir || ''),
+  })
+  refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
+  reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
+}
+
+async function fetchLegacySnapshotPayload() {
+  if (!window.eleDrive?.listInstalledPrinters || !window.eleDrive?.getDriverIndex) return null
+  const [installedPrinters, driverIndex] = await Promise.all([
+    window.eleDrive.listInstalledPrinters(),
+    window.eleDrive.getDriverIndex(),
+  ])
+  return {
+    updatedAt: String(driverIndex?.index?.updatedAt || ''),
+    backupDir: String(driverIndex?.backupDir || settings.value?.backupDir || ''),
+    installedPrinters: Array.isArray(installedPrinters) ? installedPrinters : [],
+    driverIndexEntries: Array.isArray(driverIndex?.index?.entries) ? driverIndex.index.entries : [],
+  }
+}
+
 async function loadPrinters(options = {}) {
   const silent = Boolean(options?.silent)
-  if (!window.eleDrive?.listInstalledPrinters || !window.eleDrive?.getDriverIndex) return
+  if (!window.eleDrive?.getPrinterSnapshot && !window.eleDrive?.listInstalledPrinters) return
   const seq = ++loadPrintersSeq
   if (!silent) {
     loading.value = true
     error.value = ''
     loadingOwnerSeq = seq
   }
-  const installedPromise = window.eleDrive.listInstalledPrinters()
-  const indexPromise = window.eleDrive.getDriverIndex().catch((err) => {
-    // avoid unhandled rejection when request becomes stale before awaiting index payload
-    throw err
-  })
 
-  let installed = cachedInstalledPrinters
-  let installedError = null
   try {
-    installed = await installedPromise
-    cachedInstalledPrinters = Array.isArray(installed) ? installed : []
+    let payload = null
+    if (window.eleDrive?.getPrinterSnapshot) {
+      try {
+        payload = await window.eleDrive.getPrinterSnapshot()
+      } catch (snapshotError) {
+        const msg = String(snapshotError instanceof Error ? snapshotError.message : snapshotError || '')
+        if (!msg.includes("No handler registered for 'printers:snapshot:get'")) {
+          throw snapshotError
+        }
+      }
+    }
+    if (!payload) {
+      payload = await fetchLegacySnapshotPayload()
+    }
+    if (!payload) {
+      throw new Error('无法获取打印机快照数据')
+    }
+    if (seq !== loadPrintersSeq) return
+    applyPrinterSnapshot(payload)
   } catch (err) {
-    installedError = err
-    installed = cachedInstalledPrinters
-  }
-
-  const hasInstalledSnapshot = Array.isArray(installed) && installed.length > 0
-  const canApplyInstalledSnapshot = !installedError || hasInstalledSnapshot
-
-  if (seq !== loadPrintersSeq) {
+    if (seq !== loadPrintersSeq) return
+    if (!silent) {
+      error.value = err instanceof Error ? err.message : String(err)
+    }
+  } finally {
+    if (seq !== loadPrintersSeq) return
     if (!silent && loadingOwnerSeq === seq) {
       loading.value = false
       loadingOwnerSeq = 0
-    }
-    return
-  }
-  if (canApplyInstalledSnapshot) {
-    runtimeStore.setPrinterSnapshot({
-      installedPrinters: Array.isArray(installed) ? installed : [],
-      driverIndexEntries: cachedDriverIndexEntries,
-      backupDir: cachedBackupDir,
-    })
-    initialSnapshotLoaded = true
-    refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
-    reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
-  }
-
-  if (!silent && loadingOwnerSeq === seq) {
-    loading.value = false
-    loadingOwnerSeq = 0
-  }
-  if (!silent) {
-    if (installedError) {
-      error.value = installedError instanceof Error ? installedError.message : String(installedError)
-    }
-  }
-
-  try {
-    const indexPayload = await indexPromise
-    if (seq !== loadPrintersSeq) {
-      if (!silent && loadingOwnerSeq === seq) {
-        loading.value = false
-        loadingOwnerSeq = 0
-      }
-      return
-    }
-    cachedDriverIndexEntries = Array.isArray(indexPayload?.index?.entries) ? indexPayload.index.entries : []
-    cachedBackupDir = String(indexPayload?.backupDir || '')
-    if (canApplyInstalledSnapshot) {
-      runtimeStore.setPrinterSnapshot({
-        installedPrinters: Array.isArray(installed) ? installed : [],
-        driverIndexEntries: cachedDriverIndexEntries,
-        backupDir: cachedBackupDir,
-      })
-      initialSnapshotLoaded = true
-      refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
-      reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
-    }
-    if (!silent && !installedError) {
-      error.value = ''
-    }
-  } catch (indexErr) {
-    if (seq !== loadPrintersSeq) {
-      if (!silent && loadingOwnerSeq === seq) {
-        loading.value = false
-        loadingOwnerSeq = 0
-      }
-      return
-    }
-    if (!silent && installedError) {
-      const indexMessage = indexErr instanceof Error ? indexErr.message : String(indexErr)
-      const installedMessage = installedError instanceof Error ? installedError.message : String(installedError)
-      error.value = `${installedMessage}; ${indexMessage}`
     }
   }
 }
@@ -504,18 +704,10 @@ async function handlePrinterStateUpdated(payload) {
   if (!payload || savingAction.value) return
   runtimeStore.setPrinterRuntimeState(payload)
   refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
-  if (!initialSnapshotLoaded) return
-  const changes = payload?.changes || {}
-  const hasChanges = ['addedPrinters', 'removedPrinters', 'addedPorts', 'removedPorts']
-    .some((key) => Array.isArray(changes[key]) && changes[key].length > 0)
-  if (!hasChanges) return
-  if (silentReloadTimer) {
-    clearTimeout(silentReloadTimer)
-  }
-  silentReloadTimer = setTimeout(() => {
-    silentReloadTimer = null
-    void loadPrinters({ silent: true })
-  }, 1200)
+}
+
+function handlePrinterSnapshotUpdated(payload) {
+  applyPrinterSnapshot(payload)
 }
 
 function subscribePrinterRuntimeState() {
@@ -528,6 +720,16 @@ function subscribePrinterRuntimeState() {
   })
 }
 
+function subscribePrinterSnapshot() {
+  if (!window.eleDrive?.onPrinterSnapshotUpdated) return
+  if (typeof removePrinterSnapshotUpdatedListener === 'function') {
+    removePrinterSnapshotUpdatedListener()
+  }
+  removePrinterSnapshotUpdatedListener = window.eleDrive.onPrinterSnapshotUpdated((payload) => {
+    handlePrinterSnapshotUpdated(payload)
+  })
+}
+
 function unsubscribePrinterRuntimeState() {
   if (typeof removePrinterStateUpdatedListener === 'function') {
     removePrinterStateUpdatedListener()
@@ -535,14 +737,11 @@ function unsubscribePrinterRuntimeState() {
   removePrinterStateUpdatedListener = null
 }
 
-function applyUninstallOptimistically(row) {
-  const printerName = row?.printerName
-  clearInstallButtonSuppression(printerName)
-  runtimeStore.applyOptimisticUninstall({
-    printerName,
-    keepBackup: Boolean(row?.backup),
-  })
-  markWaitingUsbReconnect(printerName, false)
+function unsubscribePrinterSnapshot() {
+  if (typeof removePrinterSnapshotUpdatedListener === 'function') {
+    removePrinterSnapshotUpdatedListener()
+  }
+  removePrinterSnapshotUpdatedListener = null
 }
 
 async function backupDriver(row) {
@@ -551,14 +750,12 @@ async function backupDriver(row) {
   error.value = ''
   try {
     await window.eleDrive.backupPrinterDriver({ printerName: row.printerName })
-    runtimeStore.applyOptimisticBackup({ printerName: row.printerName })
     ElMessage.success('备份成功')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
     ElMessage.error('备份失败')
   } finally {
     markBackingUp(row?.printerName, false)
-    await loadPrinters({ silent: true })
   }
 }
 
@@ -587,22 +784,19 @@ function closeInstallWizard(force = false) {
 function isDuplicatePrinterName(name) {
   const key = normalizePrinterKey(name)
   if (!key) return false
-  return rows.value.some((item) => item?.installed && normalizePrinterKey(item?.printerName) === key)
+  return allRows.value.some((item) => item?.installed && normalizePrinterKey(item?.printerName) === key)
 }
 
 async function runInstallTask(row, installPayload) {
   if (!window.eleDrive?.installPrinter) return false
   savingAction.value = `install:${row.printerName}`
   error.value = ''
-  let refreshedInTry = false
   let success = false
   try {
     const result = await window.eleDrive.installPrinter(installPayload)
     if (result?.status === 'driver-installed') {
-      await loadPrinters({ silent: true })
-      refreshedInTry = true
       const targetDriverName = String(result.driverName || row.driverName || '').toLowerCase()
-      const occupied = !!targetDriverName && rows.value.some(
+      const occupied = !!targetDriverName && allRows.value.some(
         (printer) => printer?.installed && String(printer.driverName || '').toLowerCase() === targetDriverName,
       )
       if (occupied) {
@@ -627,9 +821,6 @@ async function runInstallTask(row, installPayload) {
     error.value = detail
     ElMessage.error(`安装失败：${detail}`)
   } finally {
-    if (!refreshedInTry) {
-      await loadPrinters({ silent: true })
-    }
     savingAction.value = ''
   }
   return success
@@ -759,7 +950,6 @@ async function uninstallDriver(row) {
 
   uninstalling.value = true
   savingAction.value = `uninstall:${row.printerName}`
-  let shouldRefreshAfterUninstall = false
   try {
     try {
       await ElMessageBox.confirm(`确认卸载打印机“${row.printerName}”？`, '确认卸载', {
@@ -771,7 +961,6 @@ async function uninstallDriver(row) {
       return
     }
 
-    shouldRefreshAfterUninstall = true
     error.value = ''
     const result = await window.eleDrive.uninstallPrinter({ printerName: row.printerName })
     const repoResidues = result.fileRepoResidues?.length || 0
@@ -785,12 +974,14 @@ async function uninstallDriver(row) {
       const reason = result.portRemoveError ? `：${result.portRemoveError}` : ''
       ElMessage.warning(`打印机和驱动已卸载，但端口未删除${reason}`)
     } else if (hasFileLockResidue) {
-      applyUninstallOptimistically(row)
+      clearInstallButtonSuppression(row?.printerName)
+      markWaitingUsbReconnect(row?.printerName, false)
       ElMessage.success('卸载成功（部分驱动文件被系统占用，稍后会自动释放）')
     } else if (repoResidues > 0 || spoolResidues > 0) {
       ElMessage.warning(`打印机/驱动已卸载，但仍检测到残留文件（FileRepository:${repoResidues}，Spool:${spoolResidues}）`)
     } else {
-      applyUninstallOptimistically(row)
+      clearInstallButtonSuppression(row?.printerName)
+      markWaitingUsbReconnect(row?.printerName, false)
       ElMessage.success('卸载成功')
     }
   } catch (err) {
@@ -799,9 +990,6 @@ async function uninstallDriver(row) {
   } finally {
     if (savingAction.value.startsWith('uninstall:')) {
       savingAction.value = ''
-    }
-    if (shouldRefreshAfterUninstall) {
-      await loadPrinters({ silent: true })
     }
     uninstalling.value = false
   }
@@ -833,24 +1021,20 @@ async function openSystemDriverInstall() {
 
 onMounted(async () => {
   subscribePrinterRuntimeState()
-  let bootstrappedWithRuntime = false
+  subscribePrinterSnapshot()
   if (window.eleDrive?.getPrinterRuntimeState) {
     try {
       const state = await window.eleDrive.getPrinterRuntimeState()
       await handlePrinterStateUpdated(state)
-      bootstrappedWithRuntime = rows.value.length > 0
     } catch {
       // ignore bootstrap state errors
     }
   }
-  void loadPrinters({ silent: bootstrappedWithRuntime })
+  await loadPrinters({ silent: false })
 })
 
 onUnmounted(() => {
-  if (silentReloadTimer) {
-    clearTimeout(silentReloadTimer)
-    silentReloadTimer = null
-  }
+  unsubscribePrinterSnapshot()
   unsubscribePrinterRuntimeState()
 })
 </script>
@@ -880,103 +1064,210 @@ onUnmounted(() => {
     <el-alert v-if="message" :title="message" type="success" show-icon :closable="false" class="status-alert" />
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="status-alert" />
 
-    <el-table
-      :data="rows"
-      v-loading="loading && rows.length === 0"
-      row-key="printerName"
-      class="printer-table"
-      empty-text="未读取到打印机或备份索引"
-      table-layout="fixed"
-      :fit="true"
-    >
-      <el-table-column type="expand" width="46">
-        <template #default="{ row }">
-          <el-descriptions :column="1" border size="small" class="expand-desc">
-            <el-descriptions-item label="厂商">{{ row.manufacturer || '-' }}</el-descriptions-item>
-            <el-descriptions-item v-if="row.installed" label="索引INF">
-              <span class="mono">{{ infDisplayText(row) }}</span>
-            </el-descriptions-item>
-            <el-descriptions-item label="驱动状态">
+    <el-tabs v-model="activePrinterTab" class="printer-tabs" type="card">
+      <el-tab-pane label="已安装" name="installed">
+        <el-table
+          :data="installedRows"
+          v-loading="loading && installedRows.length === 0"
+          row-key="printerName"
+          class="printer-table"
+          empty-text="未读取到已安装打印机"
+          table-layout="fixed"
+          :fit="true"
+        >
+          <el-table-column type="expand" width="46">
+            <template #default="{ row }">
+              <el-descriptions :column="1" border size="small" class="expand-desc">
+                <el-descriptions-item label="厂商">{{ row.manufacturer || '-' }}</el-descriptions-item>
+                <el-descriptions-item v-if="row.installed" label="索引INF">
+                  <span class="mono">{{ infDisplayText(row) }}</span>
+                </el-descriptions-item>
+                <el-descriptions-item label="驱动状态">
+                  <el-tag size="small" :type="driverStatusType(row)" effect="plain">{{ driverStatusText(row) }}</el-tag>
+                </el-descriptions-item>
+              </el-descriptions>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="状态" width="92" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="printerAvailabilityType(row)" effect="plain">
+                {{ printerAvailabilityText(row) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="打印机" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="printer-cell">
+                <div class="printer-cell-main">
+                  <div class="cell-title" :title="row.printerName">{{ row.printerName }}</div>
+                  <div class="cell-sub" :title="`${displayPortLabel(row)}：${displayPortName(row)}`">
+                    {{ displayPortLabel(row) }}：{{ displayPortName(row) }}
+                  </div>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="驱动" width="170" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="cell-title" :title="row.driverName || '-'">{{ row.driverName || '-' }}</div>
+              <div class="cell-sub" :title="row.driverVersion || '-'">版本：{{ row.driverVersion || '-' }}</div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="驱动备份" width="92" align="center">
+            <template #default="{ row }">
               <el-tag size="small" :type="driverStatusType(row)" effect="plain">{{ driverStatusText(row) }}</el-tag>
-            </el-descriptions-item>
-          </el-descriptions>
-        </template>
-      </el-table-column>
+            </template>
+          </el-table-column>
 
-      <el-table-column label="打印机" width="220" show-overflow-tooltip>
-        <template #default="{ row }">
-          <div class="printer-cell">
-            <div class="printer-cell-main">
-              <div class="cell-title" :title="row.printerName">{{ row.printerName }}</div>
-              <div class="cell-sub" :title="`${displayPortLabel(row)}：${displayPortName(row)}`">
-                {{ displayPortLabel(row) }}：{{ displayPortName(row) }}
-              </div>
-              <div class="cell-sub">
-                <el-tag size="small" :type="printerAvailabilityType(row)" effect="plain">
-                  {{ printerAvailabilityText(row) }}
-                </el-tag>
-              </div>
-            </div>
-          </div>
-        </template>
-      </el-table-column>
-
-      <el-table-column label="驱动" min-width="200" show-overflow-tooltip>
-        <template #default="{ row }">
-          <div class="cell-title" :title="row.driverName || '-'">{{ row.driverName || '-' }}</div>
-          <div class="cell-sub" :title="row.driverVersion || '-'">版本：{{ row.driverVersion || '-' }}</div>
-        </template>
-      </el-table-column>
-
-      <el-table-column label="操作" width="98" align="center">
-        <template #default="{ row }">
-          <div class="action-row">
-            <div class="action-slot">
-              <el-dropdown
-                popper-class="printer-action-menu"
-                trigger="click"
-                :disabled="getActionTriggerState(row).busy"
-                @command="(command) => handleActionCommand(command, row)"
-              >
-                <a
-                  href="#"
-                  class="action-link"
-                  :class="{ 'is-busy': isActionButtonLoading(row) }"
-                  @click.prevent
+          <el-table-column label="操作" width="110" align="center" class-name="operation-col" label-class-name="operation-col">
+            <template #default="{ row }">
+              <div class="action-row">
+                <el-dropdown
+                  popper-class="printer-action-menu"
+                  trigger="click"
+                  :disabled="getActionTriggerState(row).busy"
+                  @command="(command) => handleInlineAction(command, row, 'installed')"
                 >
-                  <span v-if="getActionTriggerState(row).busy" class="action-link-spinner" />
-                  {{ getActionTriggerState(row).label }}
-                </a>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item
-                      v-for="item in getActionMenuItems(row)"
-                      :key="`${row.printerName}-${item.command}`"
-                      :command="item.command"
-                      :disabled="item.disabled"
-                    >
-                      <el-tooltip
-                        placement="left"
-                        :content="item.reason"
-                        :disabled="!(item.disabled && item.reason)"
+                  <a
+                    href="#"
+                    class="action-link"
+                    :class="{ 'is-busy': getActionTriggerState(row).busy }"
+                    @click.prevent
+                  >
+                    <span v-if="getActionTriggerState(row).busy" class="action-link-spinner" />
+                    {{ getActionTriggerState(row).label }}
+                    <span class="action-link-caret" aria-hidden="true" />
+                  </a>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item
+                        v-for="item in getInlineActionItems(row, 'installed')"
+                        :key="`${row.printerName}-${item.command}`"
+                        :command="item.command"
+                        :disabled="item.disabled"
                       >
-                        <span
-                          class="action-menu-item-label"
-                          :class="{ 'is-disabled': item.disabled }"
-                          :title="item.disabled ? item.reason : ''"
+                        <el-tooltip
+                          placement="left"
+                          :content="item.reason"
+                          :disabled="!(item.disabled && item.reason)"
                         >
-                          {{ item.label }}
-                        </span>
-                      </el-tooltip>
-                    </el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
-            </div>
-          </div>
-        </template>
-      </el-table-column>
-    </el-table>
+                          <span class="action-menu-item-label" :class="{ 'is-disabled': item.disabled }">
+                            <span v-if="item.loading" class="action-link-spinner" />
+                            {{ item.loading ? item.loadingLabel : item.label }}
+                          </span>
+                        </el-tooltip>
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="本地驱动" name="local-driver">
+        <el-table
+          :data="localDriverRows"
+          v-loading="loading && localDriverRows.length === 0"
+          row-key="printerName"
+          class="printer-table"
+          empty-text="暂无本地驱动"
+          table-layout="fixed"
+          :fit="true"
+        >
+          <el-table-column type="expand" width="46">
+            <template #default="{ row }">
+              <el-descriptions :column="1" border size="small" class="expand-desc">
+                <el-descriptions-item label="厂商">{{ row.manufacturer || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="驱动状态">
+                  <el-tag size="small" :type="driverStatusType(row)" effect="plain">{{ driverStatusText(row) }}</el-tag>
+                </el-descriptions-item>
+              </el-descriptions>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="打印机" width="220" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="printer-cell">
+                <div class="printer-cell-main">
+                  <div class="cell-title" :title="row.printerName">{{ row.printerName }}</div>
+                  <div class="cell-sub" :title="`${displayPortLabel(row)}：${displayPortName(row)}`">
+                    {{ displayPortLabel(row) }}：{{ displayPortName(row) }}
+                  </div>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="驱动" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="cell-title" :title="row.driverName || '-'">{{ row.driverName || '-' }}</div>
+              <div class="cell-sub" :title="row.driverVersion || '-'">版本：{{ row.driverVersion || '-' }}</div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="安装状态" width="92" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="installStateType(row)" effect="plain">{{ installStateText(row) }}</el-tag>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="110" align="center" class-name="operation-col" label-class-name="operation-col">
+            <template #default="{ row }">
+              <div class="action-row">
+                <el-dropdown
+                  popper-class="printer-action-menu"
+                  trigger="click"
+                  :disabled="getActionTriggerState(row).busy"
+                  @command="(command) => handleInlineAction(command, row, 'local-driver')"
+                >
+                  <a
+                    href="#"
+                    class="action-link"
+                    :class="{ 'is-busy': getActionTriggerState(row).busy }"
+                    @click.prevent
+                  >
+                    <span v-if="getActionTriggerState(row).busy" class="action-link-spinner" />
+                    {{ getActionTriggerState(row).label }}
+                    <span class="action-link-caret" aria-hidden="true" />
+                  </a>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item
+                        v-for="item in getInlineActionItems(row, 'local-driver')"
+                        :key="`${row.printerName}-${item.command}`"
+                        :command="item.command"
+                        :disabled="item.disabled"
+                      >
+                        <el-tooltip
+                          placement="left"
+                          :content="item.reason"
+                          :disabled="!(item.disabled && item.reason)"
+                        >
+                          <span class="action-menu-item-label" :class="{ 'is-disabled': item.disabled }">
+                            <span v-if="item.loading" class="action-link-spinner" />
+                            {{ item.loading ? item.loadingLabel : item.label }}
+                          </span>
+                        </el-tooltip>
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="网络驱动" name="network-driver">
+        <el-empty description="网络驱动数据待接入" />
+      </el-tab-pane>
+    </el-tabs>
 
     <teleport to="body">
       <transition name="wizard-fade">

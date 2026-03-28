@@ -63,6 +63,13 @@ interface DriverIndexEntry {
   extractPolicy: 'cleanup-on-success' | 'keep-on-fail'
 }
 
+interface PrinterSnapshotPayload {
+  updatedAt: string
+  backupDir: string
+  installedPrinters: InstalledPrinter[]
+  driverIndexEntries: DriverIndexEntry[]
+}
+
 interface PrinterRuntimeItem {
   name: string
   driverName: string
@@ -107,9 +114,20 @@ interface Window {
       opened: boolean
     }>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
+    getPrinterSnapshot: () => Promise<PrinterSnapshotPayload>
     listUsbPrinterPorts: () => Promise<string[]>
     getPrinterRuntimeState: () => Promise<PrinterRuntimeState>
     openSystemAddPrinterWizard: () => Promise<{ status: string }>
+    openPrinterProperties: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      dialog?: string
+    }>
+    openPrinterPreferences: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      dialog?: string
+    }>
     backupPrinterDriver: (payload: {
       printerName: string
       backupDir?: string
@@ -140,6 +158,17 @@ interface Window {
       fileRepoResidues?: string[]
       spoolResidues?: string[]
     }>
+    printTestPage: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      returnValue?: number | null
+    }>
+    deleteBackupDriver: (payload: { printerName: string }) => Promise<{
+      status: string
+      printerName: string
+      archiveRelativePath?: string
+      archiveDeleted?: boolean
+    }>
     getDriverIndex: () => Promise<{
       backupDir: string
       index: {
@@ -150,5 +179,6 @@ interface Window {
     }>
     onTrayNavigate: (handler: (payload: { path?: string } | null) => void) => () => void
     onPrinterStateUpdated: (handler: (payload: PrinterRuntimeState | null) => void) => () => void
+    onPrinterSnapshotUpdated: (handler: (payload: PrinterSnapshotPayload | null) => void) => () => void
   }
 }
