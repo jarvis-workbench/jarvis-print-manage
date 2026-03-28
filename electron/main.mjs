@@ -6,6 +6,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { loadPsScript } from './config/script/ps/index.mjs'
+import { createLanRuntime } from './lan/runtime.mjs'
 import { runPowerShell, runPowerShellJson } from './powershell.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -25,6 +26,16 @@ const ARCHIVE_FILE_SUFFIX = '.pdrv.zip'
 const ARCHIVE_EXTRACT_POLICY_DEFAULT = 'cleanup-on-success'
 const CUSTOM_PROTOCOL_SCHEME = 'hstools'
 const KNOWN_ROUTE_PATHS = new Set(['/', '/printers', '/settings', '/driver-install'])
+const DEFAULT_FEATURE_SETTINGS = {
+  backup: {
+    archiveEnabled: true,
+  },
+  lan: {
+    discoveryEnabled: false,
+    transferEnabled: false,
+    autoInstallEnabled: false,
+  },
+}
 const DEFAULT_VIRTUAL_PRINTER_CONFIG = {
   keywords: [
     'pdf',
@@ -50,6 +61,10 @@ const DEFAULT_VIRTUAL_PRINTER_CONFIG = {
 let mainWindow = null
 let tray = null
 let appIsQuitting = false
+if (isDev) {
+  const devUserDataPath = path.join(app.getPath('appData'), `${app.getName()}-dev`)
+  app.setPath('userData', devUserDataPath)
+}
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let printerStateWorker = null
 let pendingProtocolRoutePath = ''
@@ -76,12 +91,33 @@ let printerSnapshotState = {
 let printerSnapshotRefreshTimer = null
 let printerSnapshotRefreshRunning = false
 let printerSnapshotRefreshPending = false
+let lanRuntime = null
 
 function upsertIpcHandler(channel, handler) {
   try {
     ipcMain.removeHandler(channel)
   } catch {}
   ipcMain.handle(channel, handler)
+}
+
+function toBool(value, fallback = false) {
+  if (value === true || value === false) return value
+  if (typeof value === 'string') return value.toLowerCase() === 'true'
+  if (value == null) return fallback
+  return Boolean(value)
+}
+
+function normalizeFeatureSettings(feature = {}) {
+  return {
+    backup: {
+      archiveEnabled: toBool(feature?.backup?.archiveEnabled, DEFAULT_FEATURE_SETTINGS.backup.archiveEnabled),
+    },
+    lan: {
+      discoveryEnabled: toBool(feature?.lan?.discoveryEnabled, DEFAULT_FEATURE_SETTINGS.lan.discoveryEnabled),
+      transferEnabled: toBool(feature?.lan?.transferEnabled, DEFAULT_FEATURE_SETTINGS.lan.transferEnabled),
+      autoInstallEnabled: toBool(feature?.lan?.autoInstallEnabled, DEFAULT_FEATURE_SETTINGS.lan.autoInstallEnabled),
+    },
+  }
 }
 
 function broadcastPrinterState() {
@@ -101,6 +137,15 @@ function broadcastPrinterSnapshot() {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win || win.isDestroyed()) continue
     win.webContents.send('printers:snapshot-updated', payload)
+  }
+}
+
+function broadcastLanState(payload = null) {
+  const state = payload || (lanRuntime ? lanRuntime.getState() : null)
+  if (!state) return
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue
+    win.webContents.send('lan:state-updated', state)
   }
 }
 
@@ -678,28 +723,76 @@ async function readSettings() {
   try {
     const fileText = await fs.readFile(getSettingsFilePath(), 'utf-8')
     const parsed = JSON.parse(fileText)
+    const feature = normalizeFeatureSettings(parsed?.feature)
+    const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
+    feature.lan.discoveryEnabled = lanEnabled
     return {
       backupDir: parsed.backupDir || getDefaultBackupDir(),
       themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
+      lanEnabled,
+      feature,
     }
   } catch {
+    const feature = normalizeFeatureSettings()
     return {
       backupDir: getDefaultBackupDir(),
       themeMode: 'system',
+      lanEnabled: feature.lan.discoveryEnabled,
+      feature,
     }
   }
 }
 
 async function writeSettings(nextSettings) {
   const current = await readSettings()
+  const nextFeature = normalizeFeatureSettings(nextSettings?.feature || current?.feature || {})
+  const lanEnabled = typeof nextSettings?.lanEnabled === 'boolean'
+    ? nextSettings.lanEnabled
+    : toBool(current?.lanEnabled, nextFeature.lan.discoveryEnabled)
+  nextFeature.lan.discoveryEnabled = lanEnabled
   const merged = {
     backupDir: nextSettings.backupDir || current.backupDir || getDefaultBackupDir(),
     themeMode: THEME_MODES.has(nextSettings.themeMode) ? nextSettings.themeMode : current.themeMode || 'system',
+    lanEnabled,
+    feature: nextFeature,
   }
 
   await fs.mkdir(path.dirname(getSettingsFilePath()), { recursive: true })
   await fs.writeFile(getSettingsFilePath(), JSON.stringify(merged, null, 2), 'utf-8')
   return merged
+}
+
+function getLanConfigDirPath() {
+  return path.join(getResourceRootPath(), 'config')
+}
+
+function ensureLanRuntime() {
+  if (lanRuntime) return lanRuntime
+  lanRuntime = createLanRuntime({
+    configDir: getLanConfigDirPath(),
+    appVersion: app.getVersion(),
+    onStateChanged: (state) => {
+      broadcastLanState(state)
+    },
+    onError: (error) => {
+      console.warn(`[lan-runtime] ${error?.message || error}`)
+    },
+  })
+  void lanRuntime.bootstrap().catch((error) => {
+    console.warn(`[lan-runtime] bootstrap failed: ${error?.message || error}`)
+  })
+  return lanRuntime
+}
+
+async function applyLanSettings(settings = {}) {
+  const runtime = ensureLanRuntime()
+  runtime.setFeature(settings.feature || {})
+  if (toBool(settings.lanEnabled, false)) {
+    await runtime.start()
+  } else {
+    await runtime.stop()
+  }
+  return runtime.getState()
 }
 
 async function getInstalledPrinters() {
@@ -1227,6 +1320,11 @@ function createTray() {
 }
 
 function createMainWindow() {
+  const packagedAppRoot = app.getAppPath()
+  const preloadPath = app.isPackaged
+    ? path.join(packagedAppRoot, 'electron', 'preload.cjs')
+    : path.join(__dirname, 'preload.cjs')
+
   const win = new BrowserWindow({
     width: 1000,
     height: 650,
@@ -1241,7 +1339,7 @@ function createMainWindow() {
     title: APP_TITLE,
     autoHideMenuBar: true,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
+      preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -1275,7 +1373,7 @@ function createMainWindow() {
       console.error(`[renderer-load-failed] code=${code} desc=${desc} url=${url}`)
     })
   } else {
-    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    win.loadFile(path.join(packagedAppRoot, 'dist', 'index.html'))
   }
 
   // Avoid white-screen flash: reveal window only after renderer finishes loading.
@@ -1318,8 +1416,14 @@ if (!gotSingleInstanceLock) {
     handleProtocolOpen(url)
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     registerCustomProtocolClient()
+    const startupSettings = await readSettings()
+    try {
+      await applyLanSettings(startupSettings)
+    } catch (error) {
+      console.warn(`[lan-runtime] apply startup settings failed: ${error?.message || error}`)
+    }
 
     upsertIpcHandler('app:get-version', () => app.getVersion())
 
@@ -1364,6 +1468,44 @@ if (!gotSingleInstanceLock) {
         path: backupDir,
         opened: true,
       }
+    })
+
+    upsertIpcHandler('lan:get-state', async () => {
+      const runtime = ensureLanRuntime()
+      return runtime.getState()
+    })
+    upsertIpcHandler('lan:set-enabled', async (_, payload) => {
+      const enabled = toBool(payload?.enabled, false)
+      const saved = await writeSettings({ lanEnabled: enabled })
+      const state = await applyLanSettings(saved)
+      return {
+        enabled: state.enabled,
+        startedAt: state.startedAt,
+      }
+    })
+    upsertIpcHandler('lan:list-nodes', async () => {
+      const runtime = ensureLanRuntime()
+      return runtime.listNodes()
+    })
+    upsertIpcHandler('lan:list-offers', async () => {
+      const runtime = ensureLanRuntime()
+      return runtime.listOffers()
+    })
+    upsertIpcHandler('lan:request-install', async (_, payload) => {
+      const runtime = ensureLanRuntime()
+      const task = await runtime.requestInstall(payload || {})
+      return {
+        taskId: task.taskId,
+        status: task.status,
+      }
+    })
+    upsertIpcHandler('lan:get-task', async (_, payload) => {
+      const runtime = ensureLanRuntime()
+      return runtime.getTask(payload?.taskId)
+    })
+    upsertIpcHandler('lan:cancel-task', async (_, payload) => {
+      const runtime = ensureLanRuntime()
+      return runtime.cancelTask(payload?.taskId)
     })
 
     upsertIpcHandler('printers:list-installed', async () => getInstalledPrinters())
@@ -1494,6 +1636,9 @@ if (!gotSingleInstanceLock) {
   app.on('before-quit', () => {
     appIsQuitting = true
     stopPrinterStateWorker()
+    if (lanRuntime) {
+      void lanRuntime.dispose()
+    }
   })
 
   app.on('window-all-closed', () => {

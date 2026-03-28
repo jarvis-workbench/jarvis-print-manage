@@ -1,6 +1,16 @@
 import { defineStore } from 'pinia'
 
 const DEFAULT_THEME_MODE = 'system'
+const DEFAULT_FEATURE = {
+  backup: {
+    archiveEnabled: true,
+  },
+  lan: {
+    discoveryEnabled: false,
+    transferEnabled: false,
+    autoInstallEnabled: false,
+  },
+}
 
 function createEmptyChanges() {
   return {
@@ -25,6 +35,47 @@ function toBool(value) {
   if (value === true || value === false) return value
   if (typeof value === 'string') return value.toLowerCase() === 'true'
   return Boolean(value)
+}
+
+function normalizeFeatureSettings(feature = {}) {
+  return {
+    backup: {
+      archiveEnabled: toBool(feature?.backup?.archiveEnabled ?? DEFAULT_FEATURE.backup.archiveEnabled),
+    },
+    lan: {
+      discoveryEnabled: toBool(feature?.lan?.discoveryEnabled ?? DEFAULT_FEATURE.lan.discoveryEnabled),
+      transferEnabled: toBool(feature?.lan?.transferEnabled ?? DEFAULT_FEATURE.lan.transferEnabled),
+      autoInstallEnabled: toBool(feature?.lan?.autoInstallEnabled ?? DEFAULT_FEATURE.lan.autoInstallEnabled),
+    },
+  }
+}
+
+function createEmptyLanPairState() {
+  return {
+    trustedCount: 0,
+    blockedCount: 0,
+    pendingCount: 0,
+  }
+}
+
+function createEmptyLanState() {
+  return {
+    enabled: false,
+    startedAt: '',
+    nodeId: '',
+    machineName: '',
+    appVersion: '',
+    arch: '',
+    protocolVersion: '',
+    archiveVersion: '',
+    discoveryPort: 0,
+    servicePort: 0,
+    nodes: [],
+    offers: [],
+    tasks: [],
+    pairState: createEmptyLanPairState(),
+    updatedAt: '',
+  }
 }
 
 function normalizeName(value) {
@@ -322,8 +373,15 @@ export const useRuntimeStore = defineStore('runtime', {
     settings: {
       backupDir: '',
       themeMode: DEFAULT_THEME_MODE,
+      lanEnabled: false,
+      feature: normalizeFeatureSettings(),
     },
     PrinterServerManage: createEmptyPrinterServerManage(),
+    lanState: createEmptyLanState(),
+    lanNodes: [],
+    lanOffers: [],
+    lanTasks: [],
+    lanPairState: createEmptyLanPairState(),
     usbPorts: [],
     busy: {
       refreshing: false,
@@ -340,11 +398,67 @@ export const useRuntimeStore = defineStore('runtime', {
   }),
   actions: {
     setSettings(settings = {}) {
+      const feature = normalizeFeatureSettings(settings?.feature || this.settings?.feature || {})
+      const lanEnabled = typeof settings?.lanEnabled === 'boolean'
+        ? settings.lanEnabled
+        : toBool(feature?.lan?.discoveryEnabled)
+      feature.lan.discoveryEnabled = lanEnabled
       this.settings = {
         backupDir: String(settings?.backupDir || ''),
         themeMode: String(settings?.themeMode || DEFAULT_THEME_MODE),
+        lanEnabled,
+        feature,
       }
       this.settingsLoaded = true
+    },
+    setLanState(payload = {}) {
+      const nodes = Array.isArray(payload?.nodes) ? payload.nodes : []
+      const offers = Array.isArray(payload?.offers) ? payload.offers : []
+      const tasks = Array.isArray(payload?.tasks) ? payload.tasks : []
+      const pairState = {
+        ...createEmptyLanPairState(),
+        ...(payload?.pairState || {}),
+      }
+
+      this.lanState = {
+        ...createEmptyLanState(),
+        ...payload,
+        nodes,
+        offers,
+        tasks,
+        pairState,
+      }
+      this.lanNodes = nodes
+      this.lanOffers = offers
+      this.lanTasks = tasks
+      this.lanPairState = pairState
+      this.settings = {
+        ...this.settings,
+        lanEnabled: Boolean(payload?.enabled),
+        feature: {
+          ...(this.settings?.feature || normalizeFeatureSettings()),
+          lan: {
+            ...((this.settings?.feature || normalizeFeatureSettings()).lan || {}),
+            discoveryEnabled: Boolean(payload?.enabled),
+          },
+        },
+      }
+      this.lastSyncAt = new Date().toISOString()
+    },
+    setLanEnabled(enabled) {
+      const value = Boolean(enabled)
+      const feature = normalizeFeatureSettings(this.settings?.feature || {})
+      feature.lan.discoveryEnabled = value
+      this.settings = {
+        ...this.settings,
+        lanEnabled: value,
+        feature,
+      }
+      this.lanState = {
+        ...this.lanState,
+        enabled: value,
+      }
+      this.lastSyncAt = new Date().toISOString()
     },
     setPrinterSnapshot(payload = {}) {
       const installed = Array.isArray(payload?.installedPrinters) ? payload.installedPrinters : []
@@ -564,6 +678,11 @@ export const useRuntimeStore = defineStore('runtime', {
     },
     resetRuntimeCollections() {
       this.PrinterServerManage = createEmptyPrinterServerManage()
+      this.lanState = createEmptyLanState()
+      this.lanNodes = []
+      this.lanOffers = []
+      this.lanTasks = []
+      this.lanPairState = createEmptyLanPairState()
       this.usbPorts = []
       this.lastSyncAt = ''
     },

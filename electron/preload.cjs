@@ -7,6 +7,13 @@ contextBridge.exposeInMainWorld('eleDrive', {
   setThemeMode: (themeMode) => ipcRenderer.invoke('settings:set-theme-mode', themeMode),
   chooseBackupDir: () => ipcRenderer.invoke('settings:choose-backup-dir'),
   openBackupDir: () => ipcRenderer.invoke('settings:open-backup-dir'),
+  getLanState: () => ipcRenderer.invoke('lan:get-state'),
+  setLanEnabled: (payload) => ipcRenderer.invoke('lan:set-enabled', payload),
+  listLanNodes: () => ipcRenderer.invoke('lan:list-nodes'),
+  listLanOffers: () => ipcRenderer.invoke('lan:list-offers'),
+  requestLanInstall: (payload) => ipcRenderer.invoke('lan:request-install', payload),
+  getLanTask: (payload) => ipcRenderer.invoke('lan:get-task', payload),
+  cancelLanTask: (payload) => ipcRenderer.invoke('lan:cancel-task', payload),
   listInstalledPrinters: () => ipcRenderer.invoke('printers:list-installed'),
   getPrinterSnapshot: () => ipcRenderer.invoke('printers:snapshot:get'),
   listUsbPrinterPorts: () => ipcRenderer.invoke('printers:list-usb-ports'),
@@ -38,5 +45,11 @@ contextBridge.exposeInMainWorld('eleDrive', {
     const listener = (_, payload) => handler(payload)
     ipcRenderer.on('printers:snapshot-updated', listener)
     return () => ipcRenderer.removeListener('printers:snapshot-updated', listener)
+  },
+  onLanStateUpdated: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('lan:state-updated', listener)
+    return () => ipcRenderer.removeListener('lan:state-updated', listener)
   },
 })

@@ -3,8 +3,89 @@
 interface EleDriveSettings {
   backupDir: string
   themeMode: ThemeMode
+  lanEnabled?: boolean
+  feature?: {
+    backup?: {
+      archiveEnabled?: boolean
+    }
+    lan?: {
+      discoveryEnabled?: boolean
+      transferEnabled?: boolean
+      autoInstallEnabled?: boolean
+    }
+  }
 }
 type ThemeMode = 'light' | 'dark' | 'system'
+
+interface LanNode {
+  nodeId: string
+  machineName: string
+  appVersion: string
+  arch: string
+  host: string
+  servicePort: number
+  online: boolean
+  lastSeenAt: string
+}
+
+interface RemotePrinterOffer {
+  offerId: string
+  nodeId: string
+  printerName: string
+  driverName: string
+  driverVersion: string
+  environment: string
+  identityKey: string
+  archiveFormat: string
+  archiveSha256: string
+  archiveSize: number
+}
+
+interface LanTask {
+  taskId: string
+  type: string
+  status: string
+  progress: number
+  nodeId: string
+  offerId: string
+  errorCode: string
+  errorMessage: string
+  updatedAt: string
+}
+
+interface LanPairState {
+  trustedCount: number
+  blockedCount: number
+  pendingCount: number
+}
+
+interface LanRuntimeState {
+  enabled: boolean
+  startedAt: string
+  nodeId: string
+  machineName: string
+  appVersion: string
+  arch: string
+  protocolVersion: string
+  archiveVersion: string
+  discoveryPort: number
+  servicePort: number
+  feature?: {
+    backup?: {
+      archiveEnabled?: boolean
+    }
+    lan?: {
+      discoveryEnabled?: boolean
+      transferEnabled?: boolean
+      autoInstallEnabled?: boolean
+    }
+  }
+  nodes: LanNode[]
+  offers: RemotePrinterOffer[]
+  tasks: LanTask[]
+  pairState: LanPairState
+  updatedAt: string
+}
 
 interface InstalledPrinter {
   name: string
@@ -113,6 +194,23 @@ interface Window {
       path: string
       opened: boolean
     }>
+    getLanState: () => Promise<LanRuntimeState>
+    setLanEnabled: (payload: { enabled: boolean }) => Promise<{
+      enabled: boolean
+      startedAt?: string
+    }>
+    listLanNodes: () => Promise<LanNode[]>
+    listLanOffers: () => Promise<RemotePrinterOffer[]>
+    requestLanInstall: (payload: {
+      nodeId: string
+      offerId: string
+      targetPrinterName?: string
+    }) => Promise<{
+      taskId: string
+      status: string
+    }>
+    getLanTask: (payload: { taskId: string }) => Promise<LanTask>
+    cancelLanTask: (payload: { taskId: string }) => Promise<LanTask>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
     getPrinterSnapshot: () => Promise<PrinterSnapshotPayload>
     listUsbPrinterPorts: () => Promise<string[]>
@@ -180,5 +278,6 @@ interface Window {
     onTrayNavigate: (handler: (payload: { path?: string } | null) => void) => () => void
     onPrinterStateUpdated: (handler: (payload: PrinterRuntimeState | null) => void) => () => void
     onPrinterSnapshotUpdated: (handler: (payload: PrinterSnapshotPayload | null) => void) => () => void
+    onLanStateUpdated: (handler: (payload: LanRuntimeState | null) => void) => () => void
   }
 }
