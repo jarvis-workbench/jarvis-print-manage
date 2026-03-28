@@ -69,7 +69,7 @@ function stopPrinterStateWorker() {
 
 function startPrinterStateWorker() {
   if (printerStateWorker || appIsQuitting) return
-  const workerPath = path.join(__dirname, 'worker', 'printer-state-worker.mjs')
+  const workerPath = path.join(__dirname, 'worker', 'printer-state.mjs')
   printerStateWorker = new Worker(workerPath, {
     workerData: {
       pollIntervalMs: PRINTER_STATE_POLL_INTERVAL_MS,
@@ -88,12 +88,12 @@ function startPrinterStateWorker() {
     }
     if (type === 'error') {
       const msg = message?.payload?.message || 'unknown error'
-      console.warn(`[printer-state-worker] ${msg}`)
+      console.warn(`[printer-state] ${msg}`)
     }
   })
 
   printerStateWorker.on('error', (error) => {
-    console.warn(`[printer-state-worker] crash: ${error?.message || error}`)
+    console.warn(`[printer-state] crash: ${error?.message || error}`)
   })
 
   printerStateWorker.on('exit', (code) => {
@@ -123,7 +123,7 @@ function toPsSingleQuote(value) {
 }
 
 async function openSystemAddPrinterWizard() {
-  const script = await loadPsScript('open-system-add-printer-wizard')
+  const script = await loadPsScript('printer-open-system-add-wizard')
   return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
@@ -487,7 +487,7 @@ async function writeSettings(nextSettings) {
 }
 
 async function getInstalledPrinters() {
-  const script = await loadPsScript('list-installed-printers')
+  const script = await loadPsScript('printer-list-installed')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
   const list = Array.isArray(data) ? data : data ? [data] : []
   const filtered = list.filter((item) => !isVirtualPrinter(item))
@@ -501,7 +501,7 @@ async function getInstalledPrinters() {
 }
 
 async function listUsbPrinterPorts() {
-  const script = await loadPsScript('list-usb-printer-ports')
+  const script = await loadPsScript('printer-list-usb-ports')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
   if (Array.isArray(data)) {
     return data.map((item) => String(item))
@@ -516,7 +516,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
   const targetRoot = backupDir || getDefaultBackupDir()
   await fs.mkdir(targetRoot, { recursive: true })
 
-  const script = await loadPsScript('backup-printer-driver', {
+  const script = await loadPsScript('printer-backup-driver', {
     PRINTER_NAME: toPsSingleQuote(printerName),
     TARGET_ROOT: toPsSingleQuote(targetRoot),
   })
@@ -620,7 +620,7 @@ async function installPrinterFromBackup({
     }
   }
 
-  const script = await loadPsScript('install-printer-from-backup', {
+  const script = await loadPsScript('printer-install-from-backup', {
     PRINTER_NAME: toPsSingleQuote(effectivePrinterName),
     EXPECTED_DRIVER_NAME: toPsSingleQuote(entry.driverName),
     PREFERRED_PORT: toPsSingleQuote(entry.portName || ''),
@@ -636,14 +636,14 @@ async function pingHost(host) {
   if (!targetHost) {
     throw new Error('Host is required.')
   }
-  const script = await loadPsScript('ping-host', {
+  const script = await loadPsScript('printer-ping-host', {
     HOST_VALUE: toPsSingleQuote(targetHost),
   })
   return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
 async function uninstallPrinter({ printerName }) {
-  const script = await loadPsScript('uninstall-printer', {
+  const script = await loadPsScript('printer-uninstall', {
     PRINTER_NAME: toPsSingleQuote(printerName),
   })
   return runPowerShellJson(script, { timeoutMs: 120_000 })
