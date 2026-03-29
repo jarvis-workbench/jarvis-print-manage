@@ -2,6 +2,8 @@ import dgram from 'node:dgram'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 
 const LAN_PROTOCOL_VERSION = '1'
@@ -11,7 +13,12 @@ const SERVICE_PORT = 24822
 const HEARTBEAT_INTERVAL_MS = 5_000
 const NODE_STALE_MS = 16_000
 const PRUNE_INTERVAL_MS = 2_500
+const OFFER_SYNC_INTERVAL_MS = 5_000
+const OFFER_LOCAL_REFRESH_INTERVAL_MS = 15_000
+const HTTP_CLIENT_TIMEOUT_MS = 8_000
 const MAX_TASKS = 200
+const OFFER_LIST_PATH = '/lan/v1/offers'
+const OFFER_ARCHIVE_PATH_PREFIX = '/lan/v1/archive/'
 
 const DEFAULT_FEATURE = {
   backup: {
@@ -75,6 +82,16 @@ function sortNodes(list = []) {
   return [...list].sort((a, b) => String(a.machineName || '').localeCompare(String(b.machineName || '')))
 }
 
+function sortOffers(list = []) {
+  return [...list].sort((a, b) => {
+    const nodeCmp = String(a.nodeId || '').localeCompare(String(b.nodeId || ''))
+    if (nodeCmp !== 0) return nodeCmp
+    const printerCmp = String(a.printerName || '').localeCompare(String(b.printerName || ''))
+    if (printerCmp !== 0) return printerCmp
+    return String(a.offerId || '').localeCompare(String(b.offerId || ''))
+  })
+}
+
 function sortTasks(list = []) {
   return [...list].sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
 }
@@ -111,11 +128,105 @@ function buildBroadcastTargets() {
   return [...targets]
 }
 
+function normalizeOffer(rawOffer = {}, node = {}) {
+  const offerId = String(rawOffer.offerId || '').trim()
+  if (!offerId) return null
+  return {
+    offerId,
+    nodeId: String(node.nodeId || rawOffer.nodeId || '').trim(),
+    printerName: String(rawOffer.printerName || ''),
+    driverName: String(rawOffer.driverName || ''),
+    driverVersion: String(rawOffer.driverVersion || ''),
+    manufacturer: String(rawOffer.manufacturer || ''),
+    environment: String(rawOffer.environment || ''),
+    portName: String(rawOffer.portName || ''),
+    portHostAddress: String(rawOffer.portHostAddress || ''),
+    portNumber: String(rawOffer.portNumber || ''),
+    identityKey: String(rawOffer.identityKey || ''),
+    archiveFileName: String(rawOffer.archiveFileName || ''),
+    archiveRelativePath: String(rawOffer.archiveRelativePath || ''),
+    archiveFormat: String(rawOffer.archiveFormat || ''),
+    archiveSha256: String(rawOffer.archiveSha256 || '').toLowerCase(),
+    archiveSize: Number(rawOffer.archiveSize) || 0,
+    infRelativePath: String(rawOffer.infRelativePath || ''),
+    backupAt: String(rawOffer.backupAt || ''),
+    pnpDeviceId: String(rawOffer.pnpDeviceId || ''),
+    hardwareIds: Array.isArray(rawOffer.hardwareIds)
+      ? rawOffer.hardwareIds.map((item) => String(item || '')).filter(Boolean)
+      : [],
+    usbVid: String(rawOffer.usbVid || ''),
+    usbPid: String(rawOffer.usbPid || ''),
+    usbVidPid: String(rawOffer.usbVidPid || ''),
+    deviceSerial: String(rawOffer.deviceSerial || ''),
+    host: String(node.host || ''),
+    servicePort: Number(node.servicePort) || 0,
+  }
+}
+
+function buildOfferMapKey(nodeId = '', offerId = '') {
+  return `${String(nodeId || '').trim()}::${String(offerId || '').trim()}`
+}
+
+function areOffersEqual(a = {}, b = {}) {
+  const keys = [
+    'offerId',
+    'nodeId',
+    'printerName',
+    'driverName',
+    'driverVersion',
+    'manufacturer',
+    'environment',
+    'portName',
+    'portHostAddress',
+    'portNumber',
+    'identityKey',
+    'archiveFileName',
+    'archiveRelativePath',
+    'archiveFormat',
+    'archiveSha256',
+    'archiveSize',
+    'infRelativePath',
+    'backupAt',
+    'pnpDeviceId',
+    'usbVid',
+    'usbPid',
+    'usbVidPid',
+    'deviceSerial',
+    'host',
+    'servicePort',
+  ]
+  for (const key of keys) {
+    if (String(a?.[key] ?? '') !== String(b?.[key] ?? '')) {
+      return false
+    }
+  }
+  const leftHardware = Array.isArray(a?.hardwareIds) ? a.hardwareIds : []
+  const rightHardware = Array.isArray(b?.hardwareIds) ? b.hardwareIds : []
+  if (leftHardware.length !== rightHardware.length) return false
+  for (let i = 0; i < leftHardware.length; i += 1) {
+    if (String(leftHardware[i]) !== String(rightHardware[i])) return false
+  }
+  return true
+}
+
+function clampProgress(value, min = 0, max = 100) {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return min
+  return Math.min(Math.max(Math.round(num), min), max)
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export function createLanRuntime({
   configDir,
   appVersion,
   onStateChanged,
   onError,
+  onListLocalOffers,
+  onResolveOfferArchive,
+  onRequestInstall,
 } = {}) {
   const runtime = {
     enabled: false,
@@ -132,10 +243,15 @@ export function createLanRuntime({
     nodeMap: new Map(),
     offerMap: new Map(),
     taskMap: new Map(),
+    localOffers: [],
     prepared: false,
     udpSocket: null,
+    httpServer: null,
     heartbeatTimer: null,
     pruneTimer: null,
+    offerSyncTimer: null,
+    localOfferRefreshTimer: null,
+    isOfferSyncRunning: false,
   }
 
   const nodeFilePath = path.join(configDir || '.', 'lan-node.json')
@@ -151,7 +267,6 @@ export function createLanRuntime({
       onError(error)
       return
     }
-    // eslint-disable-next-line no-console
     safeWarn(`[lan-runtime] ${error?.message || error}`)
   }
 
@@ -214,6 +329,9 @@ export function createLanRuntime({
       lastSeenAt: nowIso(),
     }
     runtime.nodeMap.set(nodeId, next)
+    if (!existing || existing.host !== next.host || existing.servicePort !== next.servicePort) {
+      void syncRemoteOffers({ reason: 'node-updated' })
+    }
     emitState()
   }
 
@@ -247,6 +365,10 @@ export function createLanRuntime({
       })
 
       socket.once('error', (error) => {
+        runtime.udpSocket = null
+        try {
+          socket.close()
+        } catch {}
         reject(error)
       })
 
@@ -277,48 +399,311 @@ export function createLanRuntime({
     }
   }
 
+  function respondJson(res, statusCode, payload) {
+    const body = JSON.stringify(payload ?? null)
+    res.statusCode = statusCode
+    res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader('Content-Length', Buffer.byteLength(body))
+    res.end(body)
+  }
+
+  async function handleOfferListRequest(res) {
+    await refreshLocalOffers()
+    respondJson(res, 200, {
+      kind: 'lan-offers',
+      protocolVersion: runtime.protocolVersion,
+      archiveVersion: runtime.archiveVersion,
+      nodeId: runtime.nodeId,
+      machineName: runtime.machineName,
+      appVersion: runtime.appVersion,
+      arch: runtime.arch,
+      offers: runtime.localOffers,
+      updatedAt: nowIso(),
+    })
+  }
+
+  async function handleArchiveRequest(res, offerId) {
+    if (!offerId) {
+      respondJson(res, 400, {
+        code: 'LAN_OFFER_INVALID',
+        message: 'Missing offerId.',
+      })
+      return
+    }
+    if (typeof onResolveOfferArchive !== 'function') {
+      respondJson(res, 503, {
+        code: 'LAN_ARCHIVE_DISABLED',
+        message: 'Archive resolve callback is unavailable.',
+      })
+      return
+    }
+
+    const resolved = await onResolveOfferArchive({
+      offerId,
+      nodeId: runtime.nodeId,
+    })
+    const archivePath = String(resolved?.archivePath || '').trim()
+    if (!archivePath) {
+      respondJson(res, 404, {
+        code: 'LAN_OFFER_NOT_FOUND',
+        message: `Offer not found: ${offerId}`,
+      })
+      return
+    }
+
+    let stat = null
+    try {
+      stat = await fs.stat(archivePath)
+    } catch {}
+    if (!stat?.isFile?.()) {
+      respondJson(res, 404, {
+        code: 'LAN_ARCHIVE_NOT_FOUND',
+        message: `Archive not found: ${offerId}`,
+      })
+      return
+    }
+
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/octet-stream')
+    res.setHeader('Content-Length', String(stat.size))
+    res.setHeader('Cache-Control', 'no-store')
+    const readStream = createReadStream(archivePath)
+    readStream.on('error', (error) => {
+      if (!res.headersSent) {
+        respondJson(res, 500, {
+          code: 'LAN_ARCHIVE_STREAM_ERROR',
+          message: String(error?.message || error),
+        })
+        return
+      }
+      try {
+        res.destroy(error)
+      } catch {}
+    })
+    res.on('close', () => {
+      try {
+        readStream.destroy()
+      } catch {}
+    })
+    readStream.pipe(res)
+  }
+
+  async function handleHttpRequest(req, res) {
+    const method = String(req?.method || '').toUpperCase()
+    const host = String(req?.headers?.host || `127.0.0.1:${runtime.servicePort}`)
+    let requestUrl = null
+    try {
+      requestUrl = new URL(String(req?.url || '/'), `http://${host}`)
+    } catch {
+      respondJson(res, 400, {
+        code: 'LAN_REQUEST_INVALID',
+        message: 'Invalid URL.',
+      })
+      return
+    }
+    const pathname = requestUrl.pathname || '/'
+
+    try {
+      if (method === 'GET' && pathname === OFFER_LIST_PATH) {
+        await handleOfferListRequest(res)
+        return
+      }
+      if (method === 'GET' && pathname.startsWith(OFFER_ARCHIVE_PATH_PREFIX)) {
+        const offerIdRaw = pathname.slice(OFFER_ARCHIVE_PATH_PREFIX.length)
+        const offerId = decodeURIComponent(String(offerIdRaw || ''))
+        await handleArchiveRequest(res, offerId)
+        return
+      }
+
+      respondJson(res, 404, {
+        code: 'LAN_ROUTE_NOT_FOUND',
+        message: 'Route not found.',
+      })
+    } catch (error) {
+      emitError(error)
+      if (!res.headersSent) {
+        respondJson(res, 500, {
+          code: 'LAN_SERVER_ERROR',
+          message: String(error?.message || error),
+        })
+      } else {
+        try {
+          res.destroy(error)
+        } catch {}
+      }
+    }
+  }
+
+  async function startHttpServer() {
+    if (runtime.httpServer) return
+    await new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        void handleHttpRequest(req, res)
+      })
+      runtime.httpServer = server
+      server.once('error', (error) => {
+        runtime.httpServer = null
+        try {
+          server.close()
+        } catch {}
+        reject(error)
+      })
+      server.listen(runtime.servicePort, '0.0.0.0', () => {
+        server.removeAllListeners('error')
+        server.on('error', (error) => emitError(error))
+        resolve()
+      })
+    })
+  }
+
+  async function stopHttpServer() {
+    if (!runtime.httpServer) return
+    const server = runtime.httpServer
+    runtime.httpServer = null
+    await new Promise((resolve) => server.close(() => resolve()))
+  }
+
+  async function refreshLocalOffers() {
+    if (typeof onListLocalOffers !== 'function') {
+      runtime.localOffers = []
+      return runtime.localOffers
+    }
+    let offers = []
+    try {
+      const value = await onListLocalOffers({ nodeId: runtime.nodeId })
+      offers = Array.isArray(value) ? value : []
+    } catch (error) {
+      emitError(error)
+      offers = []
+    }
+    runtime.localOffers = sortOffers(
+      offers
+        .map((raw) => normalizeOffer(raw, { nodeId: runtime.nodeId, host: '', servicePort: runtime.servicePort }))
+        .filter(Boolean),
+    )
+    return runtime.localOffers
+  }
+
+  async function fetchRemoteOffers(node) {
+    return new Promise((resolve, reject) => {
+      const req = http.request({
+        method: 'GET',
+        hostname: node.host,
+        port: node.servicePort,
+        path: OFFER_LIST_PATH,
+        timeout: HTTP_CLIENT_TIMEOUT_MS,
+      }, (res) => {
+        const chunks = []
+        res.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf-8')
+          if (res.statusCode !== 200) {
+            reject(createLanError('LAN_OFFER_FETCH_FAILED', `node=${node.nodeId} status=${res.statusCode || 0}`))
+            return
+          }
+          let payload = null
+          try {
+            payload = JSON.parse(body)
+          } catch (error) {
+            reject(createLanError('LAN_OFFER_INVALID', `node=${node.nodeId} invalid json: ${error?.message || error}`))
+            return
+          }
+          const remoteProtocolVersion = String(payload?.protocolVersion || '')
+          if (remoteProtocolVersion && remoteProtocolVersion !== runtime.protocolVersion) {
+            reject(createLanError(
+              'LAN_PROTOCOL_MISMATCH',
+              `node=${node.nodeId} protocol mismatch local=${runtime.protocolVersion}, remote=${remoteProtocolVersion}`,
+            ))
+            return
+          }
+          const list = Array.isArray(payload?.offers) ? payload.offers : []
+          const offers = list
+            .map((raw) => normalizeOffer(raw, node))
+            .filter(Boolean)
+          resolve(offers)
+        })
+      })
+      req.on('timeout', () => {
+        req.destroy(createLanError('LAN_OFFER_FETCH_TIMEOUT', `node=${node.nodeId} timeout`))
+      })
+      req.on('error', (error) => reject(error))
+      req.end()
+    })
+  }
+
+  function applyOfferMap(nextMap) {
+    let changed = false
+    if (nextMap.size !== runtime.offerMap.size) {
+      changed = true
+    } else {
+      for (const [key, offer] of nextMap.entries()) {
+        const previous = runtime.offerMap.get(key)
+        if (!previous || !areOffersEqual(previous, offer)) {
+          changed = true
+          break
+        }
+      }
+    }
+    if (!changed) return false
+    runtime.offerMap = nextMap
+    emitState()
+    return true
+  }
+
+  async function syncRemoteOffers({ reason = '' } = {}) {
+    if (!runtime.enabled) return []
+    if (runtime.isOfferSyncRunning) return []
+    runtime.isOfferSyncRunning = true
+    try {
+      const nodes = getNodes()
+      const nextMap = new Map()
+      await Promise.all(nodes.map(async (node) => {
+        try {
+          const offers = await fetchRemoteOffers(node)
+          for (const offer of offers) {
+            const key = buildOfferMapKey(node.nodeId, offer.offerId)
+            nextMap.set(key, offer)
+          }
+        } catch (error) {
+          if (reason !== 'timer') {
+            emitError(error)
+          } else {
+            safeWarn(`[lan-runtime] offer sync failed: ${error?.message || error}`)
+          }
+        }
+      }))
+      applyOfferMap(nextMap)
+      return sortOffers([...nextMap.values()])
+    } finally {
+      runtime.isOfferSyncRunning = false
+    }
+  }
+
   function pruneNodes() {
     if (!runtime.enabled) return
     const now = Date.now()
     let changed = false
+    const removedNodeIds = []
     for (const [nodeId, node] of runtime.nodeMap.entries()) {
       const lastSeen = new Date(node.lastSeenAt || 0).getTime()
       if (!lastSeen || now - lastSeen <= NODE_STALE_MS) continue
       runtime.nodeMap.delete(nodeId)
+      removedNodeIds.push(nodeId)
       changed = true
     }
+    if (removedNodeIds.length > 0) {
+      const nextMap = new Map()
+      for (const [key, offer] of runtime.offerMap.entries()) {
+        if (!removedNodeIds.includes(String(offer.nodeId || ''))) {
+          nextMap.set(key, offer)
+        }
+      }
+      if (nextMap.size !== runtime.offerMap.size) {
+        runtime.offerMap = nextMap
+        changed = true
+      }
+    }
     if (changed) emitState()
-  }
-
-  async function start() {
-    if (runtime.enabled) return getState()
-    await bootstrap()
-    await bindSocket()
-    runtime.enabled = true
-    runtime.startedAt = nowIso()
-    runtime.heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS)
-    runtime.pruneTimer = setInterval(pruneNodes, PRUNE_INTERVAL_MS)
-    sendHeartbeat()
-    emitState()
-    return getState()
-  }
-
-  async function stop() {
-    if (!runtime.enabled) return getState()
-    runtime.enabled = false
-    runtime.startedAt = ''
-    if (runtime.heartbeatTimer) {
-      clearInterval(runtime.heartbeatTimer)
-      runtime.heartbeatTimer = null
-    }
-    if (runtime.pruneTimer) {
-      clearInterval(runtime.pruneTimer)
-      runtime.pruneTimer = null
-    }
-    runtime.nodeMap.clear()
-    await closeSocket()
-    emitState()
-    return getState()
   }
 
   async function appendTaskLog(task, action = 'task-updated') {
@@ -332,9 +717,23 @@ export function createLanRuntime({
     await fs.appendFile(taskLogFilePath, `${line}\n`, 'utf-8')
   }
 
+  async function updateTask(taskId, patch = {}, action = 'task-updated') {
+    const existing = runtime.taskMap.get(taskId)
+    if (!existing) return null
+    const next = {
+      ...existing,
+      ...patch,
+      updatedAt: nowIso(),
+    }
+    runtime.taskMap.set(taskId, next)
+    await appendTaskLog(next, action)
+    emitState()
+    return next
+  }
+
   async function createTask({
     type = 'install',
-    status = 'FAILED',
+    status = 'QUEUED',
     progress = 0,
     nodeId = '',
     offerId = '',
@@ -346,7 +745,7 @@ export function createLanRuntime({
       taskId,
       type,
       status,
-      progress,
+      progress: clampProgress(progress),
       nodeId,
       offerId,
       errorCode,
@@ -364,29 +763,108 @@ export function createLanRuntime({
     return task
   }
 
+  function getNodeAndOffer(nodeId, offerId) {
+    const node = runtime.nodeMap.get(nodeId)
+    if (!node) {
+      throw createLanError('LAN_NODE_NOT_FOUND', `Node not found: ${nodeId}`)
+    }
+    const offer = runtime.offerMap.get(buildOfferMapKey(nodeId, offerId))
+    if (!offer) {
+      throw createLanError('LAN_OFFER_NOT_FOUND', `Offer not found: ${offerId}`)
+    }
+    return { node, offer }
+  }
+
+  async function performInstallTask(taskId, payload = {}) {
+    const nodeId = String(payload?.nodeId || '').trim()
+    const offerId = String(payload?.offerId || '').trim()
+    const targetPrinterName = String(payload?.targetPrinterName || '').trim()
+    try {
+      await updateTask(taskId, {
+        status: 'DISCOVERING',
+        progress: 5,
+      }, 'task-discovering')
+      await syncRemoteOffers({ reason: 'install-request' })
+      const { node, offer } = getNodeAndOffer(nodeId, offerId)
+
+      const currentTask = runtime.taskMap.get(taskId)
+      if (currentTask?.status === 'CANCELED') return
+
+      await updateTask(taskId, {
+        status: 'OFFER_READY',
+        progress: 12,
+      }, 'task-offer-ready')
+
+      if (typeof onRequestInstall !== 'function') {
+        throw createLanError('LAN_TRANSFER_DISABLED', 'Install callback is unavailable.')
+      }
+
+      const result = await onRequestInstall({
+        node,
+        offer,
+        targetPrinterName,
+        onProgress: (progress) => {
+          const task = runtime.taskMap.get(taskId)
+          if (!task || task.status === 'CANCELED') return
+          const normalized = clampProgress(progress, 12, 99)
+          const status = normalized >= 70 ? 'INSTALLING' : 'TRANSFERRING'
+          void updateTask(taskId, {
+            status,
+            progress: normalized,
+          }, 'task-progress')
+        },
+      })
+
+      const latest = runtime.taskMap.get(taskId)
+      if (!latest || latest.status === 'CANCELED') return
+
+      await updateTask(taskId, {
+        status: 'DONE',
+        progress: 100,
+        errorCode: '',
+        errorMessage: '',
+        result: result || null,
+      }, 'task-done')
+    } catch (error) {
+      const latest = runtime.taskMap.get(taskId)
+      if (!latest || latest.status === 'CANCELED') {
+        return
+      }
+      emitError(createLanError(
+        String(error?.code || 'LAN_INSTALL_FAILED'),
+        `[lan-task] install failed taskId=${taskId} nodeId=${nodeId} offerId=${offerId}: ${String(error?.message || error)}`,
+      ))
+      await updateTask(taskId, {
+        status: 'FAILED',
+        progress: Math.min(clampProgress(latest.progress, 0, 100), 99),
+        errorCode: String(error?.code || 'LAN_INSTALL_FAILED'),
+        errorMessage: String(error?.message || error || 'install failed'),
+      }, 'task-failed')
+    }
+  }
+
   async function requestInstall(payload = {}) {
     await bootstrap()
+    if (!runtime.enabled) {
+      return createTask({
+        status: 'FAILED',
+        errorCode: 'LAN_RUNTIME_DISABLED',
+        errorMessage: 'LAN runtime is not enabled.',
+      })
+    }
     const nodeId = String(payload?.nodeId || '').trim()
     const offerId = String(payload?.offerId || '').trim()
     if (!nodeId || !offerId) {
-      throw createLanError('LAN_PROTOCOL_MISMATCH', 'Missing nodeId or offerId.')
+      throw createLanError('LAN_PAYLOAD_INVALID', 'Missing nodeId or offerId.')
     }
-    if (!runtime.feature?.lan?.transferEnabled) {
-      return createTask({
-        status: 'FAILED',
-        nodeId,
-        offerId,
-        errorCode: 'LAN_TRANSFER_DISABLED',
-        errorMessage: 'LAN transfer feature is disabled.',
-      })
-    }
-    return createTask({
-      status: 'FAILED',
+    const task = await createTask({
+      status: 'QUEUED',
+      progress: 0,
       nodeId,
       offerId,
-      errorCode: 'LAN_OFFER_FETCH_FAILED',
-      errorMessage: 'Remote offer transfer is not implemented yet.',
     })
+    void performInstallTask(task.taskId, payload)
+    return task
   }
 
   async function cancelTask(taskId) {
@@ -401,15 +879,12 @@ export function createLanRuntime({
     if (['DONE', 'FAILED', 'CANCELED'].includes(task.status)) {
       return task
     }
-    const next = {
-      ...task,
+    const next = await updateTask(normalizedTaskId, {
       status: 'CANCELED',
-      updatedAt: nowIso(),
-    }
-    runtime.taskMap.set(normalizedTaskId, next)
-    await appendTaskLog(next, 'task-canceled')
-    emitState()
-    return next
+      errorCode: '',
+      errorMessage: '',
+    }, 'task-canceled')
+    return next || task
   }
 
   function getTask(taskId) {
@@ -437,7 +912,7 @@ export function createLanRuntime({
   }
 
   function getOffers() {
-    return [...runtime.offerMap.values()]
+    return sortOffers([...runtime.offerMap.values()])
   }
 
   function getTasks() {
@@ -465,6 +940,83 @@ export function createLanRuntime({
     }
   }
 
+  async function start() {
+    if (runtime.enabled) return getState()
+    try {
+      await bootstrap()
+      await bindSocket()
+      await startHttpServer()
+      await refreshLocalOffers()
+      runtime.enabled = true
+      runtime.startedAt = nowIso()
+
+      runtime.heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS)
+      runtime.pruneTimer = setInterval(pruneNodes, PRUNE_INTERVAL_MS)
+      runtime.offerSyncTimer = setInterval(() => {
+        void syncRemoteOffers({ reason: 'timer' })
+      }, OFFER_SYNC_INTERVAL_MS)
+      runtime.localOfferRefreshTimer = setInterval(() => {
+        void refreshLocalOffers()
+      }, OFFER_LOCAL_REFRESH_INTERVAL_MS)
+
+      sendHeartbeat()
+      await sleep(120)
+      await syncRemoteOffers({ reason: 'startup' })
+      emitState()
+      return getState()
+    } catch (error) {
+      runtime.enabled = false
+      runtime.startedAt = ''
+      if (runtime.heartbeatTimer) {
+        clearInterval(runtime.heartbeatTimer)
+        runtime.heartbeatTimer = null
+      }
+      if (runtime.pruneTimer) {
+        clearInterval(runtime.pruneTimer)
+        runtime.pruneTimer = null
+      }
+      if (runtime.offerSyncTimer) {
+        clearInterval(runtime.offerSyncTimer)
+        runtime.offerSyncTimer = null
+      }
+      if (runtime.localOfferRefreshTimer) {
+        clearInterval(runtime.localOfferRefreshTimer)
+        runtime.localOfferRefreshTimer = null
+      }
+      await stopHttpServer()
+      await closeSocket()
+      throw error
+    }
+  }
+
+  async function stop() {
+    if (!runtime.enabled) return getState()
+    runtime.enabled = false
+    runtime.startedAt = ''
+    if (runtime.heartbeatTimer) {
+      clearInterval(runtime.heartbeatTimer)
+      runtime.heartbeatTimer = null
+    }
+    if (runtime.pruneTimer) {
+      clearInterval(runtime.pruneTimer)
+      runtime.pruneTimer = null
+    }
+    if (runtime.offerSyncTimer) {
+      clearInterval(runtime.offerSyncTimer)
+      runtime.offerSyncTimer = null
+    }
+    if (runtime.localOfferRefreshTimer) {
+      clearInterval(runtime.localOfferRefreshTimer)
+      runtime.localOfferRefreshTimer = null
+    }
+    runtime.nodeMap.clear()
+    runtime.offerMap.clear()
+    await closeSocket()
+    await stopHttpServer()
+    emitState()
+    return getState()
+  }
+
   function setFeature(feature = {}) {
     runtime.feature = normalizeFeatureSettings(feature)
     emitState()
@@ -477,6 +1029,7 @@ export function createLanRuntime({
   async function bootstrap() {
     if (runtime.prepared) return getState()
     await loadNodeIdentity()
+    await refreshLocalOffers()
     runtime.prepared = true
     emitState()
     return getState()
@@ -489,6 +1042,7 @@ export function createLanRuntime({
     dispose,
     setFeature,
     getState,
+    syncOffers: () => syncRemoteOffers({ reason: 'manual' }),
     listNodes: getNodes,
     listOffers: getOffers,
     listTasks: getTasks,

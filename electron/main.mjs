@@ -1,7 +1,9 @@
 ﻿import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } from 'electron'
-import { createReadStream, existsSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
+import http from 'node:http'
+import https from 'node:https'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
@@ -24,6 +26,8 @@ const POWERSHELL_TIMEOUT_MS = 30_000
 const ARCHIVE_FORMAT = 'pdrv.zip'
 const ARCHIVE_FILE_SUFFIX = '.pdrv.zip'
 const ARCHIVE_EXTRACT_POLICY_DEFAULT = 'cleanup-on-success'
+const LAN_SERVICE_ARCHIVE_PATH_PREFIX = '/lan/v1/archive/'
+const LAN_DOWNLOAD_TIMEOUT_MS = 120_000
 const CUSTOM_PROTOCOL_SCHEME = 'hstools'
 const KNOWN_ROUTE_PATHS = new Set(['/', '/printers', '/settings', '/driver-install'])
 const DEFAULT_FEATURE_SETTINGS = {
@@ -280,6 +284,13 @@ function normalizeArchiveFields(entry = {}) {
   }
 }
 
+function isTransientLanArchivePath(value) {
+  const text = String(value || '').trim().replace(/\\/g, '/').toLowerCase()
+  if (!text) return false
+  if (text.startsWith('lan-remote/')) return true
+  return text.includes('/lan-remote/')
+}
+
 function createArchiveError(code, message) {
   const error = new Error(`[${code}] ${message}`)
   error.code = code
@@ -303,6 +314,58 @@ async function computeFileSha256(filePath) {
     stream.on('error', reject)
     stream.on('end', () => resolve(hash.digest('hex')))
   })
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(Number(ms) || 0, 0)))
+}
+
+async function safeRemoveDirectory(dirPath, {
+  retries = 5,
+  delayMs = 220,
+} = {}) {
+  const target = String(dirPath || '').trim()
+  if (!target) return
+  let lastError = null
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      await fs.rm(target, { recursive: true, force: true })
+      return
+    } catch (error) {
+      lastError = error
+      const code = String(error?.code || '').toUpperCase()
+      const retryable = code === 'ENOTEMPTY' || code === 'EBUSY' || code === 'EPERM' || code === 'EACCES'
+      if (!retryable || attempt >= retries) break
+      await sleep(delayMs * (attempt + 1))
+    }
+  }
+  throw lastError
+}
+
+function normalizeArchiveFileName(name, fallback = `archive-${Date.now()}`) {
+  const raw = sanitizeFileName(name || '', fallback)
+  if (raw.toLowerCase().endsWith(ARCHIVE_FILE_SUFFIX)) {
+    return raw
+  }
+  return `${raw}${ARCHIVE_FILE_SUFFIX}`
+}
+
+async function resolveUniqueArchiveTargetPath(targetRoot, preferredFileName) {
+  const normalized = normalizeArchiveFileName(preferredFileName, `archive-${Date.now()}`)
+  const ext = path.extname(normalized)
+  const baseName = normalized.slice(0, normalized.length - ext.length)
+  let fileName = normalized
+  let absPath = path.join(targetRoot, fileName)
+  let suffix = 1
+  while (await isFileExists(absPath)) {
+    fileName = `${baseName}-${suffix}${ext}`
+    absPath = path.join(targetRoot, fileName)
+    suffix += 1
+  }
+  return {
+    archiveFileName: fileName,
+    archivePath: absPath,
+  }
 }
 
 async function createBackupArchive(backupPath, targetRoot) {
@@ -573,7 +636,8 @@ function normalizeIndex(raw) {
         environment: String(entry.environment || ''),
         ...normalizeIdentityFields(entry),
         ...normalizeArchiveFields(entry),
-      })),
+      }))
+      .filter((entry) => !isTransientLanArchivePath(entry.archiveRelativePath || entry.archiveFileName)),
   }
 }
 
@@ -659,6 +723,10 @@ async function ensureBackupIndex(backupDir) {
 }
 
 async function upsertIndexEntry(backupDir, nextEntry) {
+  const archiveFields = normalizeArchiveFields(nextEntry)
+  if (isTransientLanArchivePath(archiveFields.archiveRelativePath || archiveFields.archiveFileName)) {
+    throw new Error('Transient LAN archive path cannot be persisted in backup index.')
+  }
   const indexObj = await ensureBackupIndex(backupDir)
   const key = nextEntry.printerName.toLowerCase()
   const nextIdentityKey = buildIndexIdentityKey(nextEntry)
@@ -861,6 +929,392 @@ async function writeSettings(nextSettings) {
   return merged
 }
 
+function sanitizeFileName(name, fallback = 'archive') {
+  const raw = String(name || '').trim()
+  const sanitized = raw
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return sanitized || fallback
+}
+
+function sanitizeLanArchiveRelativePath(rawRelativePath, fallbackOfferId = '') {
+  const raw = String(rawRelativePath || '').trim().replace(/\\/g, '/')
+  const fallbackName = sanitizeFileName(fallbackOfferId || `offer-${Date.now()}`, 'offer')
+  const base = sanitizeFileName(path.posix.basename(raw || `${fallbackName}${ARCHIVE_FILE_SUFFIX}`), fallbackName)
+  const withExt = base.toLowerCase().endsWith(ARCHIVE_FILE_SUFFIX)
+    ? base
+    : `${base}${ARCHIVE_FILE_SUFFIX}`
+  return path.posix.join('lan-remote', withExt)
+}
+
+function buildLanOfferId(entry = {}) {
+  const archive = normalizeArchiveFields(entry)
+  const seed = [
+    String(entry.printerName || ''),
+    String(entry.driverName || ''),
+    String(entry.driverVersion || ''),
+    String(entry.environment || ''),
+    String(entry.portHostAddress || entry.portName || ''),
+    String(entry.pnpDeviceId || ''),
+    String(archive.archiveRelativePath || archive.archiveFileName || ''),
+    String(archive.archiveSha256 || ''),
+  ].join('|')
+  const digest = createHash('sha1').update(seed).digest('hex').slice(0, 24)
+  return `offer-${digest}`
+}
+
+function toLanOfferRecord({ entry = {}, backupDir = '', nodeId = '' } = {}) {
+  const archive = normalizeArchiveFields(entry)
+  const archiveRelativePath = String(archive.archiveRelativePath || archive.archiveFileName || '').trim()
+  if (!archiveRelativePath) return null
+  const archiveFileName = String(archive.archiveFileName || path.basename(archiveRelativePath)).trim()
+  const archivePath = path.join(backupDir, archiveRelativePath)
+  const identityKey = buildIndexIdentityKey(entry)
+    || `${String(entry.driverName || '').trim().toLowerCase()}::${String(entry.printerName || '').trim().toLowerCase()}`
+  return {
+    offerId: buildLanOfferId(entry),
+    nodeId: String(nodeId || '').trim(),
+    printerName: String(entry.printerName || ''),
+    driverName: String(entry.driverName || ''),
+    driverVersion: String(entry.driverVersion || ''),
+    manufacturer: String(entry.manufacturer || ''),
+    environment: String(entry.environment || ''),
+    portName: String(entry.portName || ''),
+    portHostAddress: String(entry.portHostAddress || ''),
+    portNumber: String(entry.portNumber || ''),
+    pnpDeviceId: String(entry.pnpDeviceId || ''),
+    hardwareIds: normalizeStringArray(entry.hardwareIds),
+    usbVid: String(entry.usbVid || ''),
+    usbPid: String(entry.usbPid || ''),
+    usbVidPid: String(entry.usbVidPid || ''),
+    deviceSerial: String(entry.deviceSerial || ''),
+    infRelativePath: String(entry.infRelativePath || ''),
+    backupAt: String(entry.backupAt || ''),
+    identityKey,
+    archiveFileName,
+    archiveRelativePath,
+    archivePath,
+    archiveFormat: String(archive.archiveFormat || ARCHIVE_FORMAT || ''),
+    archiveSha256: String(archive.archiveSha256 || '').toLowerCase(),
+    archiveSize: Number(archive.archiveSize) || 0,
+    extractPolicy: String(archive.extractPolicy || ARCHIVE_EXTRACT_POLICY_DEFAULT),
+  }
+}
+
+async function listLanTransferOffers({ nodeId = '' } = {}) {
+  const settings = await readSettings()
+  const backupDir = await ensureWritableBackupDir(settings?.backupDir)
+  const indexObj = await ensureBackupIndex(backupDir)
+  const offers = []
+  for (const entry of indexObj.entries || []) {
+    const offer = toLanOfferRecord({ entry, backupDir, nodeId })
+    if (!offer?.archiveRelativePath) continue
+    const archiveExists = await isFileExists(offer.archivePath)
+    if (!archiveExists) continue
+    if (!offer.archiveSize) {
+      try {
+        const stat = await fs.stat(offer.archivePath)
+        if (stat.isFile()) {
+          offer.archiveSize = Number(stat.size) || 0
+        }
+      } catch {}
+    }
+    offers.push({
+      offerId: offer.offerId,
+      nodeId: offer.nodeId,
+      printerName: offer.printerName,
+      driverName: offer.driverName,
+      driverVersion: offer.driverVersion,
+      manufacturer: offer.manufacturer,
+      environment: offer.environment,
+      portName: offer.portName,
+      portHostAddress: offer.portHostAddress,
+      portNumber: offer.portNumber,
+      identityKey: offer.identityKey,
+      archiveFileName: offer.archiveFileName,
+      archiveRelativePath: offer.archiveRelativePath,
+      archiveFormat: offer.archiveFormat,
+      archiveSha256: offer.archiveSha256,
+      archiveSize: offer.archiveSize,
+      infRelativePath: offer.infRelativePath,
+      backupAt: offer.backupAt,
+      pnpDeviceId: offer.pnpDeviceId,
+      hardwareIds: offer.hardwareIds,
+      usbVid: offer.usbVid,
+      usbPid: offer.usbPid,
+      usbVidPid: offer.usbVidPid,
+      deviceSerial: offer.deviceSerial,
+    })
+  }
+  return offers.sort((a, b) => String(a.printerName || '').localeCompare(String(b.printerName || '')))
+}
+
+async function resolveLanOfferArchive({ offerId = '', nodeId = '' } = {}) {
+  const normalizedOfferId = String(offerId || '').trim()
+  if (!normalizedOfferId) return null
+  const offers = await listLanTransferOffers({ nodeId })
+  const matched = offers.find((item) => String(item.offerId || '') === normalizedOfferId)
+  if (!matched) return null
+  const settings = await readSettings()
+  const backupDir = await ensureWritableBackupDir(settings?.backupDir)
+  const archivePath = path.join(backupDir, String(matched.archiveRelativePath || ''))
+  const archiveExists = await isFileExists(archivePath)
+  if (!archiveExists) return null
+  return {
+    offer: matched,
+    archivePath,
+  }
+}
+
+async function downloadLanArchiveToPath({ archiveUrl, targetPath, timeoutMs = LAN_DOWNLOAD_TIMEOUT_MS, onProgress } = {}) {
+  const urlObj = new URL(String(archiveUrl || ''))
+  const client = urlObj.protocol === 'https:' ? https : http
+  const tmpPath = `${targetPath}.downloading-${Date.now()}-${randomUUID().slice(0, 8)}`
+  await fs.mkdir(path.dirname(targetPath), { recursive: true })
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let req = null
+    let fileStream = null
+    const hash = createHash('sha256')
+    let downloaded = 0
+    let total = 0
+
+    const cleanup = async () => {
+      try {
+        if (fileStream) {
+          fileStream.destroy()
+        }
+      } catch {}
+      try {
+        await fs.rm(tmpPath, { force: true })
+      } catch {}
+    }
+
+    const finish = async (error, payload = null) => {
+      if (settled) return
+      settled = true
+      if (req) {
+        try { req.destroy() } catch {}
+      }
+      if (error) {
+        await cleanup()
+        reject(error)
+        return
+      }
+      try {
+        await fs.rename(tmpPath, targetPath)
+      } catch (renameError) {
+        await cleanup()
+        reject(renameError)
+        return
+      }
+      resolve(payload || {
+        size: downloaded,
+        sha256: hash.digest('hex'),
+      })
+    }
+
+    req = client.request(urlObj, { method: 'GET', timeout: timeoutMs }, (res) => {
+      const statusCode = Number(res.statusCode || 0)
+      if (statusCode !== 200) {
+        const chunks = []
+        res.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+        res.on('end', () => {
+          const bodyText = Buffer.concat(chunks).toString('utf-8').slice(0, 400)
+          void finish(new Error(`LAN archive download failed: HTTP ${statusCode}${bodyText ? ` ${bodyText}` : ''}`))
+        })
+        return
+      }
+
+      total = Number(res.headers['content-length'] || 0) || 0
+      fileStream = createWriteStream(tmpPath, { flags: 'w' })
+      fileStream.on('error', (error) => {
+        void finish(error)
+      })
+      res.on('error', (error) => {
+        void finish(error)
+      })
+      res.on('data', (chunk) => {
+        const buf = Buffer.from(chunk)
+        downloaded += buf.length
+        hash.update(buf)
+        if (typeof onProgress === 'function') {
+          try {
+            onProgress({
+              downloaded,
+              total,
+            })
+          } catch {}
+        }
+      })
+      res.pipe(fileStream)
+      fileStream.on('close', () => {
+        void finish(null, {
+          size: downloaded,
+          sha256: hash.digest('hex'),
+        })
+      })
+    })
+
+    req.on('timeout', () => {
+      void finish(new Error('LAN archive download timeout.'))
+    })
+    req.on('error', (error) => {
+      void finish(error)
+    })
+    req.end()
+  })
+}
+
+async function installLanOfferFromRemote({
+  node,
+  offer,
+  targetPrinterName = '',
+  onProgress,
+} = {}) {
+  const host = String(node?.host || '').trim()
+  const servicePort = Number(node?.servicePort) || 0
+  const offerId = String(offer?.offerId || '').trim()
+  if (!host || !servicePort || !offerId) {
+    throw new Error('LAN offer install payload is invalid.')
+  }
+
+  const settings = await readSettings()
+  const backupDir = await ensureWritableBackupDir(settings?.backupDir)
+  const tempArchiveRoot = path.join(backupDir, 'lan-remote')
+  await fs.mkdir(tempArchiveRoot, { recursive: true })
+  const tempArchiveTarget = await resolveUniqueArchiveTargetPath(
+    tempArchiveRoot,
+    path.basename(String(offer.archiveFileName || `${offerId}${ARCHIVE_FILE_SUFFIX}`)),
+  )
+  const tempArchivePath = tempArchiveTarget.archivePath
+  const archiveUrl = `http://${host}:${servicePort}${LAN_SERVICE_ARCHIVE_PATH_PREFIX}${encodeURIComponent(offerId)}`
+
+  if (typeof onProgress === 'function') {
+    onProgress(8)
+  }
+
+  const downloadResult = await downloadLanArchiveToPath({
+    archiveUrl,
+    targetPath: tempArchivePath,
+    timeoutMs: LAN_DOWNLOAD_TIMEOUT_MS,
+    onProgress: ({ downloaded, total }) => {
+      if (typeof onProgress !== 'function') return
+      if (!total || total <= 0) return
+      const ratio = Math.max(0, Math.min(downloaded / total, 1))
+      const progress = Math.round(8 + (ratio * 52))
+      onProgress(progress)
+    },
+  })
+
+  const actualSha256 = String(downloadResult?.sha256 || '').toLowerCase()
+  const expectedSha256 = String(offer?.archiveSha256 || '').trim().toLowerCase()
+  if (expectedSha256 && actualSha256 && expectedSha256 !== actualSha256) {
+    logWarn(`[lan-install] archive hash mismatch, continue with downloaded file. expected=${expectedSha256}, actual=${actualSha256}`)
+  }
+
+  const actualSize = Number(downloadResult?.size) || 0
+  const expectedSize = Number(offer?.archiveSize) || 0
+  if (expectedSize > 0 && actualSize > 0 && expectedSize !== actualSize) {
+    logWarn(`[lan-install] archive size mismatch, continue with downloaded file. expected=${expectedSize}, actual=${actualSize}`)
+  }
+
+  let resolvedInfRelativePath = String(offer?.infRelativePath || '')
+  const installEntry = {
+    printerName: String(offer?.printerName || ''),
+    driverName: String(offer?.driverName || ''),
+    driverVersion: String(offer?.driverVersion || ''),
+    manufacturer: String(offer?.manufacturer || ''),
+    infRelativePath: resolvedInfRelativePath,
+    backupAt: String(offer?.backupAt || new Date().toISOString()),
+    portName: String(offer?.portName || ''),
+    portHostAddress: String(offer?.portHostAddress || ''),
+    portNumber: String(offer?.portNumber || ''),
+    environment: String(offer?.environment || ''),
+    pnpDeviceId: String(offer?.pnpDeviceId || ''),
+    hardwareIds: normalizeStringArray(offer?.hardwareIds),
+    usbVid: String(offer?.usbVid || ''),
+    usbPid: String(offer?.usbPid || ''),
+    usbVidPid: String(offer?.usbVidPid || ''),
+    deviceSerial: String(offer?.deviceSerial || ''),
+    archiveFileName: '',
+    archiveRelativePath: '',
+    archiveSha256: actualSha256 || expectedSha256,
+    archiveSize: actualSize || expectedSize,
+    archiveFormat: String(offer?.archiveFormat || ARCHIVE_FORMAT || ''),
+    extractPolicy: ARCHIVE_EXTRACT_POLICY_DEFAULT,
+  }
+
+  let shouldCleanupTempArchive = false
+  try {
+    if (typeof onProgress === 'function') {
+      onProgress(70)
+    }
+    const installResult = await installPrinterFromArchive({
+      archivePath: tempArchivePath,
+      entry: installEntry,
+      targetPrinterName: String(targetPrinterName || '').trim(),
+      portHostAddressOverride: '',
+      onResolvedInfRelativePath: async (fallbackInf) => {
+        resolvedInfRelativePath = String(fallbackInf || '').trim()
+      },
+    })
+
+    if (typeof onProgress === 'function') {
+      onProgress(90)
+    }
+
+    const persistedArchiveTarget = await resolveUniqueArchiveTargetPath(
+      backupDir,
+      path.basename(String(offer.archiveFileName || `${offerId}${ARCHIVE_FILE_SUFFIX}`)),
+    )
+    await fs.copyFile(tempArchivePath, persistedArchiveTarget.archivePath)
+    const persistedArchiveStat = await fs.stat(persistedArchiveTarget.archivePath)
+    await upsertIndexEntry(backupDir, {
+      ...installEntry,
+      printerName: String(installResult?.printerName || installEntry.printerName),
+      infRelativePath: resolvedInfRelativePath,
+      archiveFileName: persistedArchiveTarget.archiveFileName,
+      archiveRelativePath: persistedArchiveTarget.archiveFileName,
+      archiveSha256: actualSha256 || expectedSha256,
+      archiveSize: Number(persistedArchiveStat?.size || actualSize || expectedSize || 0),
+    })
+    shouldCleanupTempArchive = true
+
+    requestPrinterStateRefresh()
+    await refreshPrinterSnapshot({ broadcast: true })
+
+    if (typeof onProgress === 'function') {
+      onProgress(100)
+    }
+
+    return {
+      status: String(installResult?.status || 'done'),
+      printerName: String(installResult?.printerName || installEntry.printerName),
+      driverName: String(installResult?.driverName || installEntry.driverName),
+      archiveRelativePath: persistedArchiveTarget.archiveFileName,
+      backupPersisted: true,
+    }
+  } catch (error) {
+    logWarn(`[lan-install] failed. offerId=${offerId}, archive=${tempArchivePath}, message=${error?.message || error}`)
+    throw error
+  } finally {
+    if (shouldCleanupTempArchive) {
+      try {
+        await fs.rm(tempArchivePath, { force: true })
+      } catch {}
+      try {
+        const rest = await fs.readdir(tempArchiveRoot)
+        if (!rest.length) {
+          await fs.rm(tempArchiveRoot, { recursive: true, force: true })
+        }
+      } catch {}
+    }
+  }
+}
+
 function getLanConfigDirPath() {
   // LAN runtime identity and task logs must be machine-local and writable.
   return path.join(app.getPath('userData'), 'lan')
@@ -871,6 +1325,15 @@ function ensureLanRuntime() {
   lanRuntime = createLanRuntime({
     configDir: getLanConfigDirPath(),
     appVersion: app.getVersion(),
+    onListLocalOffers: async ({ nodeId } = {}) => listLanTransferOffers({ nodeId }),
+    onResolveOfferArchive: async ({ offerId, nodeId } = {}) => resolveLanOfferArchive({ offerId, nodeId }),
+    onRequestInstall: async ({ node, offer, targetPrinterName, onProgress } = {}) =>
+      installLanOfferFromRemote({
+        node,
+        offer,
+        targetPrinterName,
+        onProgress,
+      }),
     onStateChanged: (state) => {
       broadcastLanState(state)
     },
@@ -1045,7 +1508,114 @@ async function backupPrinterDriver({ printerName, backupDir }) {
     }
   } finally {
     if (String(backupPath || '').trim()) {
-      await fs.rm(backupPath, { recursive: true, force: true })
+      try {
+        await safeRemoveDirectory(backupPath, {
+          retries: 8,
+          delayMs: 280,
+        })
+      } catch (error) {
+        logWarn(`[backup-cleanup] failed to remove temp backup dir: ${error?.message || error}`)
+      }
+    }
+  }
+}
+
+async function installPrinterFromArchive({
+  archivePath,
+  entry,
+  targetPrinterName = '',
+  portHostAddressOverride = '',
+  onResolvedInfRelativePath,
+} = {}) {
+  const normalizedEntry = {
+    printerName: String(entry?.printerName || '').trim(),
+    driverName: String(entry?.driverName || '').trim(),
+    portName: String(entry?.portName || '').trim(),
+    portHostAddress: String(entry?.portHostAddress || '').trim(),
+    infRelativePath: String(entry?.infRelativePath || '').trim(),
+    archiveSha256: String(entry?.archiveSha256 || '').trim().toLowerCase(),
+  }
+  const normalizedArchivePath = String(archivePath || '').trim()
+  if (!normalizedArchivePath) {
+    throw createArchiveError('ARCHIVE_NOT_FOUND', '驱动备份压缩包路径为空。')
+  }
+  const archiveExists = await isFileExists(normalizedArchivePath)
+  if (!archiveExists) {
+    throw createArchiveError('ARCHIVE_NOT_FOUND', `驱动备份压缩包不存在：${normalizedArchivePath}`)
+  }
+  if (normalizedEntry.archiveSha256) {
+    const actualHash = await computeFileSha256(normalizedArchivePath)
+    if (actualHash !== normalizedEntry.archiveSha256) {
+      throw createArchiveError('ARCHIVE_HASH_MISMATCH', `驱动备份压缩包哈希不匹配：${normalizedArchivePath}`)
+    }
+  }
+
+  const effectivePrinterName = String(targetPrinterName || '').trim() || normalizedEntry.printerName
+  const effectivePortHostAddress = String(portHostAddressOverride || '').trim() || normalizedEntry.portHostAddress
+
+  let backupPath = ''
+  let extractDir = ''
+  let installSucceeded = false
+
+  try {
+    const taskId = `install-${Date.now()}-${randomUUID().split('-')[0]}`
+    const extracted = await extractBackupArchive(normalizedArchivePath, taskId)
+    extractDir = extracted.extractDir
+    backupPath = extractDir
+  } catch (error) {
+    throw createArchiveError(
+      'ARCHIVE_EXTRACT_FAILED',
+      `驱动备份压缩包解压失败：${normalizedArchivePath}。${error?.message || error}.`,
+    )
+  }
+
+  let infPath = path.join(backupPath, normalizedEntry.infRelativePath || '')
+  let infRelativePath = normalizedEntry.infRelativePath || ''
+  let validInfPath = false
+
+  try {
+    const stat = await fs.stat(infPath)
+    validInfPath = stat.isFile() && infPath.toLowerCase().endsWith('.inf')
+  } catch {
+    validInfPath = false
+  }
+
+  if (!validInfPath) {
+    let fallbackInf = ''
+    try {
+      fallbackInf = await findInfRelativePath(backupPath, path.basename(infRelativePath || ''))
+    } catch {
+      fallbackInf = ''
+    }
+    if (fallbackInf) {
+      infRelativePath = fallbackInf
+      infPath = path.join(backupPath, fallbackInf)
+      if (typeof onResolvedInfRelativePath === 'function') {
+        await onResolvedInfRelativePath(fallbackInf)
+      }
+    } else {
+      throw createArchiveError(
+        'ARCHIVE_INF_NOT_FOUND',
+        `驱动备份压缩包中未找到可安装的 INF 文件：${normalizedArchivePath}`,
+      )
+    }
+  }
+
+  const script = await loadPsScript('printer-install-from-backup', {
+    PRINTER_NAME: toPsSingleQuote(effectivePrinterName),
+    EXPECTED_DRIVER_NAME: toPsSingleQuote(normalizedEntry.driverName),
+    PREFERRED_PORT: toPsSingleQuote(normalizedEntry.portName || ''),
+    PREFERRED_PORT_HOST: toPsSingleQuote(effectivePortHostAddress),
+    INF_PATH: toPsSingleQuote(infPath),
+    BACKUP_PATH: toPsSingleQuote(backupPath),
+  })
+  try {
+    const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
+    installSucceeded = true
+    return result
+  } finally {
+    if (extractDir && installSucceeded) {
+      await safeCleanupExtractDir(extractDir)
     }
   }
 }
@@ -1071,83 +1641,19 @@ async function installPrinterFromBackup({
   if (!archivePath) {
     throw createArchiveError('ARCHIVE_NOT_FOUND', `备份索引缺少压缩包路径：${entry.printerName}`)
   }
-
-  let backupPath = ''
-  let extractDir = ''
-  let installSucceeded = false
-
-  const archiveExists = await isFileExists(archivePath)
-  if (!archiveExists) {
-    throw createArchiveError('ARCHIVE_NOT_FOUND', `驱动备份压缩包不存在：${archivePath}`)
-  }
-  const expectedHash = String(entry.archiveSha256 || '').trim().toLowerCase()
-  if (expectedHash) {
-    const actualHash = await computeFileSha256(archivePath)
-    if (actualHash !== expectedHash) {
-      throw createArchiveError('ARCHIVE_HASH_MISMATCH', `驱动备份压缩包哈希不匹配：${archivePath}`)
-    }
-  }
-  try {
-    const taskId = `install-${Date.now()}-${randomUUID().split('-')[0]}`
-    const extracted = await extractBackupArchive(archivePath, taskId)
-    extractDir = extracted.extractDir
-    backupPath = extractDir
-  } catch (error) {
-    throw createArchiveError(
-      'ARCHIVE_EXTRACT_FAILED',
-      `驱动备份压缩包解压失败：${archivePath}。${error?.message || error}.`,
-    )
-  }
-
-  let infPath = path.join(backupPath, entry.infRelativePath || '')
-  let infRelativePath = entry.infRelativePath || ''
-  let validInfPath = false
-
-  try {
-    const stat = await fs.stat(infPath)
-    validInfPath = stat.isFile() && infPath.toLowerCase().endsWith('.inf')
-  } catch {
-    validInfPath = false
-  }
-
-  if (!validInfPath) {
-    let fallbackInf = ''
-    try {
-      fallbackInf = await findInfRelativePath(backupPath, path.basename(infRelativePath || ''))
-    } catch {
-      fallbackInf = ''
-    }
-    if (fallbackInf) {
-      infRelativePath = fallbackInf
-      infPath = path.join(backupPath, fallbackInf)
-
-      // Backfill index entry when older records miss INF relative path.
+  return installPrinterFromArchive({
+    archivePath,
+    entry,
+    targetPrinterName: effectivePrinterName,
+    portHostAddressOverride: effectivePortHostAddress,
+    onResolvedInfRelativePath: async (fallbackInf) => {
+      if (!fallbackInf) return
       await upsertIndexEntry(resolvedBackupDir, {
         ...entry,
         infRelativePath: fallbackInf,
       })
-    } else {
-      infPath = ''
-    }
-  }
-
-  const script = await loadPsScript('printer-install-from-backup', {
-    PRINTER_NAME: toPsSingleQuote(effectivePrinterName),
-    EXPECTED_DRIVER_NAME: toPsSingleQuote(entry.driverName),
-    PREFERRED_PORT: toPsSingleQuote(entry.portName || ''),
-    PREFERRED_PORT_HOST: toPsSingleQuote(effectivePortHostAddress),
-    INF_PATH: toPsSingleQuote(infPath),
-    BACKUP_PATH: toPsSingleQuote(backupPath),
+    },
   })
-  try {
-    const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
-    installSucceeded = true
-    return result
-  } finally {
-    if (extractDir && installSucceeded) {
-      await safeCleanupExtractDir(extractDir)
-    }
-  }
 }
 
 async function pingHost(host) {
@@ -1600,6 +2106,9 @@ if (!gotSingleInstanceLock) {
     })
     upsertIpcHandler('lan:list-offers', async () => {
       const runtime = ensureLanRuntime()
+      if (typeof runtime.syncOffers === 'function') {
+        await runtime.syncOffers()
+      }
       return runtime.listOffers()
     })
     upsertIpcHandler('lan:request-install', async (_, payload) => {

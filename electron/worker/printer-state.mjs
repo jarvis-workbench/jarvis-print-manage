@@ -3,7 +3,10 @@ import { loadPsScript } from '../config/script/ps/index.mjs'
 import { runPowerShellJson } from '../powershell.mjs'
 
 const pollIntervalMs = Math.max(Number(workerData?.pollIntervalMs) || 2000, 1000)
-const WORKER_POWERSHELL_TIMEOUT_MS = 30_000
+const WORKER_POWERSHELL_TIMEOUT_MS = 45_000
+const ERROR_REPORT_INTERVAL_MS = 10_000
+const TIMEOUT_BACKOFF_BASE_MS = 5_000
+const TIMEOUT_BACKOFF_MAX_MS = 60_000
 
 let timer = null
 let seq = 0
@@ -14,6 +17,12 @@ let lastState = {
   spooler: 'unknown',
 }
 let runtimeStateScriptPromise = null
+let pollingInFlight = false
+let pendingForcedPoll = false
+let timeoutStreak = 0
+let timeoutBackoffUntil = 0
+let lastErrorKey = ''
+let lastErrorAt = 0
 
 function toBool(value) {
   if (value === true || value === false) return value
@@ -226,9 +235,42 @@ function emitState(nextState, changes) {
   })
 }
 
+function isPowerShellTimeoutError(error) {
+  const text = String(error?.message || error || '').toLowerCase()
+  return text.includes('timed out')
+}
+
+function emitWorkerError(message, key = message) {
+  const now = Date.now()
+  const normalizedKey = String(key || '').trim() || String(message || '').trim()
+  if (normalizedKey && normalizedKey === lastErrorKey && now - lastErrorAt < ERROR_REPORT_INTERVAL_MS) {
+    return
+  }
+  lastErrorKey = normalizedKey
+  lastErrorAt = now
+  parentPort?.postMessage({
+    type: 'error',
+    payload: {
+      message: String(message || 'unknown error'),
+    },
+  })
+}
+
 async function pollOnce(force = false) {
+  if (pollingInFlight) {
+    if (force) {
+      pendingForcedPoll = true
+    }
+    return
+  }
+  if (!force && timeoutBackoffUntil > Date.now()) {
+    return
+  }
+  pollingInFlight = true
   try {
     const next = await collectPrinterRuntimeState()
+    timeoutStreak = 0
+    timeoutBackoffUntil = 0
     const nextSignature = buildSignature(next)
     if (!force && nextSignature === lastSignature) return
     const changes = diffState(lastState, next)
@@ -236,12 +278,27 @@ async function pollOnce(force = false) {
     lastSignature = nextSignature
     emitState(next, changes)
   } catch (error) {
-    parentPort?.postMessage({
-      type: 'error',
-      payload: {
-        message: error?.message || String(error),
-      },
-    })
+    if (isPowerShellTimeoutError(error)) {
+      timeoutStreak += 1
+      const backoffMs = Math.min(TIMEOUT_BACKOFF_MAX_MS, TIMEOUT_BACKOFF_BASE_MS * timeoutStreak)
+      timeoutBackoffUntil = Date.now() + backoffMs
+      emitWorkerError(
+        `${error?.message || String(error)} (timeoutStreak=${timeoutStreak}, backoff=${backoffMs}ms)`,
+        'powershell-timeout',
+      )
+      return
+    }
+    timeoutStreak = 0
+    timeoutBackoffUntil = 0
+    emitWorkerError(error?.message || String(error))
+  } finally {
+    pollingInFlight = false
+    if (pendingForcedPoll) {
+      pendingForcedPoll = false
+      queueMicrotask(() => {
+        void pollOnce(true)
+      })
+    }
   }
 }
 

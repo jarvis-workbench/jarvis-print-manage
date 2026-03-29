@@ -1,5 +1,5 @@
 ﻿<script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { RefreshOne } from '@icon-park/vue-next'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -29,6 +29,8 @@ const openingBackupDir = ref(false)
 const openingBackupDirPrinterKey = ref('')
 const error = ref('')
 const message = ref('')
+const lanLoading = ref(false)
+const requestingLanInstallKeys = ref(new Set())
 const firstScreenLoading = ref(true)
 const firstSnapshotReady = ref(false)
 const firstRuntimeReady = ref(false)
@@ -40,10 +42,11 @@ const FIRST_LOAD_MIN_MS = 450
 const FIRST_LOAD_FORCE_DONE_MS = 15_000
 
 const runtimeStore = useRuntimeStore()
-const { settings, PrinterServerManage } = storeToRefs(runtimeStore)
+const { settings, PrinterServerManage, lanState, lanNodes, lanOffers, lanTasks } = storeToRefs(runtimeStore)
 const waitingUsbReconnectNames = ref(new Set())
 let removePrinterStateUpdatedListener = null
 let removePrinterSnapshotUpdatedListener = null
+let removeLanStateUpdatedListener = null
 let loadPrintersSeq = 0
 let loadingOwnerSeq = 0
 const installSuppressedUntil = ref(new Map())
@@ -52,7 +55,63 @@ const activePrinterTab = ref('installed')
 const allRows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
 const installedRows = computed(() => allRows.value.filter((item) => item?.installed))
 const localDriverRows = computed(() => allRows.value.filter((item) => item?.backup))
-const networkDriverRows = computed(() => [])
+const lanEnabled = computed(() => Boolean(lanState.value?.enabled || settings.value?.lanEnabled))
+const lanNodeMap = computed(() => {
+  const map = new Map()
+  const list = Array.isArray(lanNodes.value) ? lanNodes.value : []
+  for (const item of list) {
+    const nodeId = String(item?.nodeId || '').trim()
+    if (!nodeId) continue
+    map.set(nodeId, item)
+  }
+  return map
+})
+const lanTaskMap = computed(() => {
+  const map = new Map()
+  const list = Array.isArray(lanTasks.value) ? lanTasks.value : []
+  for (const task of list) {
+    const nodeId = String(task?.nodeId || '').trim()
+    const offerId = String(task?.offerId || '').trim()
+    if (!nodeId || !offerId) continue
+    const key = `${nodeId}::${offerId}`
+    const previous = map.get(key)
+    const nextTime = new Date(task?.updatedAt || 0).getTime()
+    const previousTime = new Date(previous?.updatedAt || 0).getTime()
+    if (!previous || nextTime >= previousTime) {
+      map.set(key, task)
+    }
+  }
+  return map
+})
+const networkDriverRows = computed(() => {
+  const offers = Array.isArray(lanOffers.value) ? lanOffers.value : []
+  const installedList = installedRows.value
+  return offers
+    .map((offer) => {
+      const nodeId = String(offer?.nodeId || '').trim()
+      const offerId = String(offer?.offerId || '').trim()
+      const key = `${nodeId}::${offerId}`
+      const task = lanTaskMap.value.get(key) || null
+      const node = lanNodeMap.value.get(nodeId) || null
+      const installed = isLanOfferInstalledLocally(offer, installedList)
+      return {
+        ...offer,
+        key,
+        installed,
+        nodeName: String(node?.machineName || nodeId || '-'),
+        nodeHost: String(node?.host || offer?.host || ''),
+        nodeArch: String(node?.arch || ''),
+        task,
+      }
+    })
+    .sort((a, b) => String(a.printerName || '').localeCompare(String(b.printerName || '')))
+})
+const networkDriverEmptyText = computed(() => {
+  if (!lanEnabled.value) return '请先在系统设置中开启局域网组网'
+  if (lanLoading.value) return ''
+  if (!Array.isArray(lanNodes.value) || lanNodes.value.length === 0) return '未发现局域网节点'
+  return '暂无可安装的网络驱动'
+})
 const totalPrinters = computed(() => {
   const tab = String(activePrinterTab.value || 'installed')
   if (tab === 'installed') return installedRows.value.length
@@ -115,6 +174,100 @@ function clearInstallWizardIpHint() {
 
 function normalizePrinterKey(value) {
   return String(value || '').trim().toLowerCase()
+}
+
+function normalizeToken(value) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function normalizeIpOrPort(rawValue) {
+  const ip = parseIpCandidate(rawValue)
+  if (ip) return normalizeToken(ip)
+  return normalizeToken(rawValue)
+}
+
+function normalizeUsbVidPid(item = {}) {
+  const raw = String(item?.usbVidPid || '').trim()
+  if (raw) return raw.toUpperCase()
+  const usbVid = String(item?.usbVid || '').trim().toUpperCase()
+  const usbPid = String(item?.usbPid || '').trim().toUpperCase()
+  if (!usbVid || !usbPid) return ''
+  return `${usbVid}:${usbPid}`
+}
+
+function isLanOfferInstalledLocally(offer = {}, installedList = []) {
+  const offerDriver = normalizeToken(offer?.driverName)
+  const offerPrinter = normalizeToken(offer?.printerName)
+  const offerHost = normalizeIpOrPort(offer?.portHostAddress || offer?.portName)
+  const offerPnp = normalizeToken(offer?.pnpDeviceId)
+  const offerUsbVidPid = normalizeToken(normalizeUsbVidPid(offer))
+
+  return installedList.some((installedItem) => {
+    if (!installedItem?.installed) return false
+    const localDriver = normalizeToken(installedItem?.driverName)
+    const localPrinter = normalizeToken(installedItem?.printerName)
+    const localHost = normalizeIpOrPort(installedItem?.portHostAddress || installedItem?.portName)
+    const localPnp = normalizeToken(installedItem?.pnpDeviceId)
+    const localUsbVidPid = normalizeToken(normalizeUsbVidPid(installedItem))
+
+    if (offerPnp && localPnp && offerPnp === localPnp) return true
+    if (offerUsbVidPid && localUsbVidPid && offerUsbVidPid === localUsbVidPid) return true
+    if (offerDriver && offerPrinter && offerDriver === localDriver && offerPrinter === localPrinter) return true
+    if (offerDriver && offerHost && offerDriver === localDriver && offerHost === localHost) return true
+    return false
+  })
+}
+
+function isLanTaskRunning(task = null) {
+  const status = String(task?.status || '').toUpperCase()
+  return ['QUEUED', 'DISCOVERING', 'OFFER_READY', 'TRANSFERRING', 'INSTALLING'].includes(status)
+}
+
+function getLanTaskText(task = null) {
+  const status = String(task?.status || '').toUpperCase()
+  const progress = Number(task?.progress || 0)
+  if (status === 'QUEUED') return '排队中'
+  if (status === 'DISCOVERING') return '发现节点中'
+  if (status === 'OFFER_READY') return '驱动包就绪'
+  if (status === 'TRANSFERRING') return `传输中 ${Math.max(0, Math.min(Math.round(progress), 99))}%`
+  if (status === 'INSTALLING') return `安装中 ${Math.max(0, Math.min(Math.round(progress), 99))}%`
+  if (status === 'DONE') return '安装完成'
+  if (status === 'FAILED') return '安装失败'
+  if (status === 'CANCELED') return '已取消'
+  return '-'
+}
+
+function getLanTaskTagType(task = null) {
+  const status = String(task?.status || '').toUpperCase()
+  if (status === 'DONE') return 'success'
+  if (status === 'FAILED') return 'danger'
+  if (status === 'CANCELED') return 'warning'
+  if (isLanTaskRunning(task)) return 'warning'
+  return 'info'
+}
+
+function formatArchiveSize(size) {
+  const bytes = Number(size) || 0
+  if (bytes <= 0) return '-'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+function markRequestingLanInstall(row, loading) {
+  const key = String(row?.key || `${row?.nodeId || ''}::${row?.offerId || ''}`).trim()
+  if (!key) return
+  const next = new Set(requestingLanInstallKeys.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  requestingLanInstallKeys.value = next
+}
+
+function isRequestingLanInstall(row) {
+  const key = String(row?.key || `${row?.nodeId || ''}::${row?.offerId || ''}`).trim()
+  if (!key) return false
+  return requestingLanInstallKeys.value.has(key)
 }
 
 function markBackingUp(printerName, loading) {
@@ -368,6 +521,38 @@ function getDeleteBackupDisableReason(row) {
   return ''
 }
 
+function getLanInstallDisableReason(row) {
+  if (!lanEnabled.value) return '请先在系统设置中开启局域网组网'
+  if (uninstalling.value) return '正在卸载，请稍后'
+  if (installFlowActive.value) return '正在安装，请稍后'
+  if (backupFlowActive.value) return '正在备份，请稍后'
+  if (!row?.nodeId || !row?.offerId) return '驱动标识缺失'
+  if (row?.installed) return '本机已安装'
+  if (isRequestingLanInstall(row)) return '正在提交安装任务'
+  if (isLanTaskRunning(row?.task)) return '安装任务执行中'
+  return ''
+}
+
+function networkInstallStateText(row) {
+  if (row?.installed) return '已安装'
+  const task = row?.task || null
+  const status = String(task?.status || '').toUpperCase()
+  if (!status) return '待安装'
+  if (status === 'DONE') return '已完成'
+  if (status === 'FAILED') return '失败'
+  if (status === 'CANCELED') return '已取消'
+  return getLanTaskText(task)
+}
+
+function networkInstallStateType(row) {
+  if (row?.installed) return 'success'
+  return getLanTaskTagType(row?.task || null)
+}
+
+function networkInstallErrorText(row) {
+  return String(row?.task?.errorMessage || '').trim()
+}
+
 function isOpeningBackupDir(row) {
   const key = normalizePrinterKey(row?.printerName)
   return openingBackupDir.value && key && openingBackupDirPrinterKey.value === key
@@ -470,10 +655,29 @@ function getInlineActionItems(row, tabName = activePrinterTab.value) {
     return actions
   }
 
+  if (tab === 'network-driver') {
+    const installReason = getLanInstallDisableReason(row)
+    actions.push({
+      command: 'lan-install',
+      label: '安装到本机',
+      disabled: Boolean(installReason),
+      reason: installReason,
+      loading: isRequestingLanInstall(row) || isLanTaskRunning(row?.task),
+      loadingLabel: isRequestingLanInstall(row) ? '正在提交' : getLanTaskText(row?.task),
+    })
+    return actions
+  }
+
   return actions
 }
 
-function getActionTriggerState(row) {
+function getActionTriggerState(row, tabName = activePrinterTab.value) {
+  const tab = String(tabName || activePrinterTab.value || 'installed')
+  if (tab === 'network-driver') {
+    if (isRequestingLanInstall(row)) return { busy: true, label: '正在提交' }
+    if (isLanTaskRunning(row?.task)) return { busy: true, label: getLanTaskText(row?.task) }
+    return { busy: false, label: '操作' }
+  }
   const name = String(row?.printerName || '')
   if (isOpeningProperties(row) || isOpeningPreferences(row)) return { busy: true, label: '正在打开' }
   if (isPrintingTest(row)) return { busy: true, label: '正在发送' }
@@ -573,6 +777,81 @@ async function deleteBackup(row) {
   }
 }
 
+function applyLanState(payload) {
+  runtimeStore.setLanState(payload || {})
+}
+
+async function refreshLanState(options = {}) {
+  if (!window.eleDrive?.getLanState) return
+  const silent = Boolean(options?.silent)
+  if (!silent) {
+    lanLoading.value = true
+  }
+  try {
+    let state = await window.eleDrive.getLanState()
+    if (window.eleDrive?.listLanOffers) {
+      const offers = await window.eleDrive.listLanOffers()
+      state = {
+        ...(state || {}),
+        offers: Array.isArray(offers) ? offers : [],
+      }
+    }
+    applyLanState(state || {})
+  } catch (err) {
+    if (!silent) {
+      const detail = err instanceof Error ? err.message : String(err)
+      error.value = detail
+    }
+  } finally {
+    if (!silent) {
+      lanLoading.value = false
+    }
+  }
+}
+
+function subscribeLanState() {
+  if (!window.eleDrive?.onLanStateUpdated) return
+  if (typeof removeLanStateUpdatedListener === 'function') {
+    removeLanStateUpdatedListener()
+  }
+  removeLanStateUpdatedListener = window.eleDrive.onLanStateUpdated((payload) => {
+    applyLanState(payload || {})
+  })
+}
+
+function unsubscribeLanState() {
+  if (typeof removeLanStateUpdatedListener === 'function') {
+    removeLanStateUpdatedListener()
+  }
+  removeLanStateUpdatedListener = null
+}
+
+async function requestLanInstall(row) {
+  if (!window.eleDrive?.requestLanInstall) return
+  const disabledReason = getLanInstallDisableReason(row)
+  if (disabledReason) return
+
+  markRequestingLanInstall(row, true)
+  error.value = ''
+  try {
+    const response = await window.eleDrive.requestLanInstall({
+      nodeId: row.nodeId,
+      offerId: row.offerId,
+    })
+    if (!response?.taskId) {
+      throw new Error('安装任务创建失败：未返回任务ID')
+    }
+    ElMessage.success('已创建网络安装任务')
+    await refreshLanState({ silent: true })
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`创建安装任务失败：${detail}`)
+  } finally {
+    markRequestingLanInstall(row, false)
+  }
+}
+
 function handleInlineAction(command, row, tabName = activePrinterTab.value) {
   if (!row) return
   const cmd = String(command || '')
@@ -610,6 +889,10 @@ function handleInlineAction(command, row, tabName = activePrinterTab.value) {
   }
   if (cmd === 'delete-backup') {
     void deleteBackup(row)
+    return
+  }
+  if (cmd === 'lan-install') {
+    void requestLanInstall(row)
   }
 }
 
@@ -1092,6 +1375,7 @@ onMounted(() => {
 
   subscribePrinterRuntimeState()
   subscribePrinterSnapshot()
+  subscribeLanState()
 
   if (window.eleDrive?.getPrinterRuntimeState) {
     void window.eleDrive.getPrinterRuntimeState()
@@ -1105,12 +1389,19 @@ onMounted(() => {
   }
 
   void loadPrinters({ silent: false })
+  void refreshLanState({ silent: true })
 })
 
 onUnmounted(() => {
   clearFirstLoadTimers()
+  unsubscribeLanState()
   unsubscribePrinterSnapshot()
   unsubscribePrinterRuntimeState()
+})
+
+watch(activePrinterTab, (tab) => {
+  if (String(tab || '') !== 'network-driver') return
+  void refreshLanState({ silent: false })
 })
 </script>
 
@@ -1210,17 +1501,17 @@ onUnmounted(() => {
                 <el-dropdown
                   popper-class="printer-action-menu"
                   trigger="click"
-                  :disabled="getActionTriggerState(row).busy"
+                  :disabled="getActionTriggerState(row, 'installed').busy"
                   @command="(command) => handleInlineAction(command, row, 'installed')"
                 >
                   <a
                     href="#"
                     class="action-link"
-                    :class="{ 'is-busy': getActionTriggerState(row).busy }"
+                    :class="{ 'is-busy': getActionTriggerState(row, 'installed').busy }"
                     @click.prevent
                   >
-                    <span v-if="getActionTriggerState(row).busy" class="action-link-spinner" />
-                    {{ getActionTriggerState(row).label }}
+                    <span v-if="getActionTriggerState(row, 'installed').busy" class="action-link-spinner" />
+                    {{ getActionTriggerState(row, 'installed').label }}
                     <span class="action-link-caret" aria-hidden="true" />
                   </a>
                   <template #dropdown>
@@ -1304,17 +1595,17 @@ onUnmounted(() => {
                 <el-dropdown
                   popper-class="printer-action-menu"
                   trigger="click"
-                  :disabled="getActionTriggerState(row).busy"
+                  :disabled="getActionTriggerState(row, 'local-driver').busy"
                   @command="(command) => handleInlineAction(command, row, 'local-driver')"
                 >
                   <a
                     href="#"
                     class="action-link"
-                    :class="{ 'is-busy': getActionTriggerState(row).busy }"
+                    :class="{ 'is-busy': getActionTriggerState(row, 'local-driver').busy }"
                     @click.prevent
                   >
-                    <span v-if="getActionTriggerState(row).busy" class="action-link-spinner" />
-                    {{ getActionTriggerState(row).label }}
+                    <span v-if="getActionTriggerState(row, 'local-driver').busy" class="action-link-spinner" />
+                    {{ getActionTriggerState(row, 'local-driver').label }}
                     <span class="action-link-caret" aria-hidden="true" />
                   </a>
                   <template #dropdown>
@@ -1346,7 +1637,107 @@ onUnmounted(() => {
       </el-tab-pane>
 
       <el-tab-pane label="网络驱动" name="network-driver">
-        <el-empty description="网络驱动数据待接入" />
+        <el-table
+          :data="networkDriverRows"
+          v-loading="lanLoading"
+          row-key="key"
+          class="printer-table"
+          :empty-text="networkDriverEmptyText"
+          table-layout="fixed"
+          :fit="true"
+        >
+          <el-table-column label="状态" width="128" align="center">
+            <template #default="{ row }">
+              <el-tooltip
+                placement="top"
+                :content="networkInstallErrorText(row)"
+                :disabled="!networkInstallErrorText(row)"
+              >
+                <el-tag size="small" :type="networkInstallStateType(row)" effect="plain">
+                  {{ networkInstallStateText(row) }}
+                </el-tag>
+              </el-tooltip>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="来源节点" width="210" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="cell-title" :title="row.nodeName">{{ row.nodeName || '-' }}</div>
+              <div class="cell-sub" :title="row.nodeHost || '-'">
+                {{ row.nodeHost || '-' }}
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="打印机" min-width="210" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="cell-title" :title="row.printerName || '-'">{{ row.printerName || '-' }}</div>
+              <div class="cell-sub" :title="`${row.portHostAddress || row.portName || '-'}`">
+                端口：{{ row.portHostAddress || row.portName || '-' }}
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="驱动" min-width="210" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div class="cell-title" :title="row.driverName || '-'">{{ row.driverName || '-' }}</div>
+              <div class="cell-sub" :title="row.driverVersion || '-'">
+                版本：{{ row.driverVersion || '-' }}
+              </div>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="驱动包" width="138" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" type="info" effect="plain">{{ formatArchiveSize(row.archiveSize) }}</el-tag>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="120" align="center" class-name="operation-col" label-class-name="operation-col">
+            <template #default="{ row }">
+              <div class="action-row">
+                <el-dropdown
+                  popper-class="printer-action-menu"
+                  trigger="click"
+                  :disabled="getActionTriggerState(row, 'network-driver').busy"
+                  @command="(command) => handleInlineAction(command, row, 'network-driver')"
+                >
+                  <a
+                    href="#"
+                    class="action-link"
+                    :class="{ 'is-busy': getActionTriggerState(row, 'network-driver').busy }"
+                    @click.prevent
+                  >
+                    <span v-if="getActionTriggerState(row, 'network-driver').busy" class="action-link-spinner" />
+                    {{ getActionTriggerState(row, 'network-driver').label }}
+                    <span class="action-link-caret" aria-hidden="true" />
+                  </a>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item
+                        v-for="item in getInlineActionItems(row, 'network-driver')"
+                        :key="`${row.key}-${item.command}`"
+                        :command="item.command"
+                        :disabled="item.disabled"
+                      >
+                        <el-tooltip
+                          placement="left"
+                          :content="item.reason"
+                          :disabled="!(item.disabled && item.reason)"
+                        >
+                          <span class="action-menu-item-label" :class="{ 'is-disabled': item.disabled }">
+                            <span v-if="item.loading" class="action-link-spinner" />
+                            {{ item.loading ? item.loadingLabel : item.label }}
+                          </span>
+                        </el-tooltip>
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
       </el-tab-pane>
       </el-tabs>
     </div>

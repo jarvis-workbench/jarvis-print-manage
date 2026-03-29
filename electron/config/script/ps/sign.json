@@ -1,7 +1,7 @@
 {
   "algorithm": "sha256",
   "appId": "cc.eu.iiot.hs.tool",
-  "generatedAt": "2026-03-28T11:29:35.180Z",
+  "generatedAt": "2026-03-29T13:28:10.521Z",
   "scripts": {
     "printer-archive-create": {
       "file": "printer-archive-create.scps1",
@@ -20,8 +20,8 @@
     },
     "printer-install-from-backup": {
       "file": "printer-install-from-backup.scps1",
-      "hash": "ba6c124a254cac8e2c6c4ea7ddb641216ce298be656dc447119309fe43b4fe63",
-      "appHash": "b1cf8251d2fe0501b07d20476fc77e7fdf89bdeaecec3f82eed16137976b8042"
+      "hash": "10a1d3d7c685fb1ad94251cba86efd9770b3b93c81cb35cc748c0d76e5f22f20",
+      "appHash": "da91b8fb7bbd672b76084113fedf0a4442bc2ed68f90be83fdaa3e7da1628cd1"
     },
     "printer-list-installed": {
       "file": "printer-list-installed.scps1",
@@ -60,8 +60,8 @@
     },
     "printer-runtime-state": {
       "file": "printer-runtime-state.scps1",
-      "hash": "a76214de1c8170397a4038d979db728b0d016ad2ea5ecae6309cfb189b948302",
-      "appHash": "fc32b1c8129564387e8c5d9dc8e325449dfd2e4a5eec8f7b06fbfb3626491ac8"
+      "hash": "a3bef0a45cd0023ef99a1d219ca2a91ed93e233b2e490e671e549b8c27020fbe",
+      "appHash": "ece49725b69552c2162a6c3a651a52af8944edac47a2d253247143f7ccd9c583"
     },
     "printer-uninstall": {
       "file": "printer-uninstall.scps1",

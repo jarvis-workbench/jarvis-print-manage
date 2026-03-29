@@ -103,6 +103,30 @@
       }
     }
 
+    function Test-PnpUtilSucceeded {
+      param(
+        [int]$ExitCode,
+        [string]$Output
+      )
+      if ($ExitCode -eq 0) {
+        return $true
+      }
+      $text = [string]$Output
+      if (-not $text) {
+        return $false
+      }
+      if ($text -match '(?im)Published Name\s*:\s*(oem\d+\.inf)') {
+        return $true
+      }
+      if ($text -match '(?im)Driver package added successfully') {
+        return $true
+      }
+      if ($text -match '(?im)驱动程序包.*(已成功添加|添加成功)') {
+        return $true
+      }
+      return $false
+    }
+
     $existing = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
     if ($existing) {
       [PSCustomObject]@{ status = 'already-installed'; printerName = $printerName } | ConvertTo-Json -Compress
@@ -125,10 +149,14 @@
         Ensure-InfSourceLayout -InfPath $candidateInf
       }
       $pnpOutput = (& pnputil.exe /add-driver $infPath /install 2>&1 | Out-String)
-      if ($LASTEXITCODE -ne 0) {
+      $pnpDirectExitCode = $LASTEXITCODE
+      $pnpDirectOk = Test-PnpUtilSucceeded -ExitCode $pnpDirectExitCode -Output $pnpOutput
+      if (-not $pnpDirectOk) {
         $pnpFallbackOutput = (& pnputil.exe /add-driver (Join-Path $backupPath '*.inf') /subdirs /install 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to install driver package. pnputil direct output: $pnpOutput; fallback output: $pnpFallbackOutput"
+        $pnpFallbackExitCode = $LASTEXITCODE
+        $pnpFallbackOk = Test-PnpUtilSucceeded -ExitCode $pnpFallbackExitCode -Output $pnpFallbackOutput
+        if (-not $pnpFallbackOk) {
+          throw "Failed to install driver package. directExitCode=$pnpDirectExitCode; fallbackExitCode=$pnpFallbackExitCode; pnputil direct output: $pnpOutput; fallback output: $pnpFallbackOutput"
         }
         $pnpOutput = $pnpOutput + [Environment]::NewLine + $pnpFallbackOutput
       }

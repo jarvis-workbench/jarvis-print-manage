@@ -1,13 +1,6 @@
 
     $ErrorActionPreference = 'Stop'
     $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
-    if ($spooler -and $spooler.Status -ne 'Running') {
-      try {
-        Start-Service -Name spooler -ErrorAction Stop
-        Start-Sleep -Milliseconds 700
-      } catch {}
-    }
-    $spooler = Get-Service -Name spooler -ErrorAction SilentlyContinue
     if (-not $spooler -or $spooler.Status -ne 'Running') {
       [PSCustomObject]@{
         spooler = 'stopped'
@@ -24,29 +17,29 @@
       }
     }
     $pnpEntityMap = @{}
-    foreach ($pnpEntity in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+    foreach ($pnpEntity in (Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPClass = 'Printer'" -ErrorAction SilentlyContinue)) {
       if ($pnpEntity -and $pnpEntity.DeviceID) {
         $pnpEntityMap[[string]$pnpEntity.DeviceID] = $pnpEntity
       }
     }
-    $presentPnpMap = @{}
+    $presentPnpList = @()
     if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-      foreach ($device in (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
-        if ($device -and $device.InstanceId) {
-          $presentPnpMap[[string]$device.InstanceId.ToLower()] = $true
-        }
+      $presentPnpList = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
+    }
+    $presentPnpMap = @{}
+    foreach ($device in $presentPnpList) {
+      if ($device -and $device.InstanceId) {
+        $presentPnpMap[[string]$device.InstanceId.ToLower()] = $true
       }
     }
     $presentUsbPrinterNames = @()
-    if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-      foreach ($device in (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)) {
-        $instanceId = [string]$device.InstanceId
-        if (-not $instanceId) { continue }
-        if ($instanceId -like 'USBPRINT\*') {
-          $friendly = [string]$device.FriendlyName
-          if ($friendly) {
-            $presentUsbPrinterNames += $friendly.ToLower()
-          }
+    foreach ($device in $presentPnpList) {
+      $instanceId = [string]$device.InstanceId
+      if (-not $instanceId) { continue }
+      if ($instanceId -like 'USBPRINT\*') {
+        $friendly = [string]$device.FriendlyName
+        if ($friendly) {
+          $presentUsbPrinterNames += $friendly.ToLower()
         }
       }
     }
@@ -146,4 +139,3 @@
       printers = $printers
       ports = $ports
     } | ConvertTo-Json -Depth 8 -Compress
-
