@@ -60,7 +60,20 @@ onUnmounted(() => {
     </el-aside>
 
     <el-main class="content-wrap">
-      <router-view />
+      <router-view v-slot="{ Component, route }">
+        <keep-alive>
+          <component
+            :is="Component"
+            v-if="route.name === 'printers'"
+            :key="route.name || route.path"
+          />
+        </keep-alive>
+        <component
+          :is="Component"
+          v-if="route.name !== 'printers'"
+          :key="route.name || route.path"
+        />
+      </router-view>
     </el-main>
   </el-container>
 </template>

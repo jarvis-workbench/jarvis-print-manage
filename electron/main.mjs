@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { loadPsScript } from './config/script/ps/index.mjs'
 import { createLanRuntime } from './lan/runtime.mjs'
+import { createPrintSocketService } from './print-socket-service.mjs'
 import { runPowerShell, runPowerShellJson } from './powershell.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -30,6 +31,7 @@ const LAN_SERVICE_ARCHIVE_PATH_PREFIX = '/lan/v1/archive/'
 const LAN_DOWNLOAD_TIMEOUT_MS = 120_000
 const CUSTOM_PROTOCOL_SCHEME = 'hstools'
 const KNOWN_ROUTE_PATHS = new Set(['/', '/printers', '/settings', '/driver-install'])
+const DEFAULT_PRINT_SERVICE_PORT = 17521
 const DEFAULT_FEATURE_SETTINGS = {
   backup: {
     archiveEnabled: true,
@@ -91,11 +93,23 @@ let printerSnapshotState = {
   backupDir: '',
   installedPrinters: [],
   driverIndexEntries: [],
+  printerManage: [],
+  spooler: 'unknown',
+  ports: [],
+  changes: {
+    addedPrinters: [],
+    removedPrinters: [],
+    changedPrinters: [],
+    addedPorts: [],
+    removedPorts: [],
+  },
 }
 let printerSnapshotRefreshTimer = null
 let printerSnapshotRefreshRunning = false
 let printerSnapshotRefreshPending = false
 let lanRuntime = null
+let printSocketService = null
+let printerStateWorkerStarting = false
 
 function isBrokenPipeError(error) {
   if (!error) return false
@@ -152,6 +166,14 @@ function normalizeFeatureSettings(feature = {}) {
   }
 }
 
+function normalizePrintServicePort(value, fallback = DEFAULT_PRINT_SERVICE_PORT) {
+  const port = Number(value)
+  if (!Number.isFinite(port)) return fallback
+  const normalized = Math.trunc(port)
+  if (normalized < 1 || normalized > 65535) return fallback
+  return normalized
+}
+
 function broadcastPrinterState() {
   const payload = {
     ...printerRuntimeState,
@@ -181,9 +203,21 @@ function broadcastLanState(payload = null) {
   }
 }
 
-function hasSnapshotRuntimeStructuralChanges(changes = {}) {
-  return ['addedPrinters', 'removedPrinters', 'addedPorts', 'removedPorts']
-    .some((key) => Array.isArray(changes?.[key]) && changes[key].length > 0)
+function broadcastPrintServiceState(payload = null) {
+  const state = payload || (printSocketService ? printSocketService.getState() : null)
+  if (!state) return
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue
+    win.webContents.send('print:service:state-updated', state)
+  }
+}
+
+function broadcastPrintJob(payload = null) {
+  if (!payload) return
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue
+    win.webContents.send('print:job-updated', payload)
+  }
 }
 
 function requestPrinterStateRefresh() {
@@ -193,7 +227,20 @@ function requestPrinterStateRefresh() {
   } catch {}
 }
 
+function updatePrinterStateWorkerConfig(payload = {}) {
+  if (!printerStateWorker) return
+  try {
+    printerStateWorker.postMessage({
+      type: 'config',
+      payload: {
+        backupDir: String(payload?.backupDir || '').trim(),
+      },
+    })
+  } catch {}
+}
+
 function stopPrinterStateWorker() {
+  printerStateWorkerStarting = false
   if (printerSnapshotRefreshTimer) {
     clearTimeout(printerSnapshotRefreshTimer)
     printerSnapshotRefreshTimer = null
@@ -208,26 +255,37 @@ function stopPrinterStateWorker() {
   printerStateWorker = null
 }
 
-function startPrinterStateWorker() {
+function createPrinterStateWorker({ backupDir = '' } = {}) {
   if (printerStateWorker || appIsQuitting) return
   const workerPath = path.join(__dirname, 'worker', 'printer-state.mjs')
   printerStateWorker = new Worker(workerPath, {
     workerData: {
       pollIntervalMs: PRINTER_STATE_POLL_INTERVAL_MS,
+      backupDir: String(backupDir || '').trim(),
     },
   })
 
   printerStateWorker.on('message', (message) => {
     const type = String(message?.type || '')
     if (type === 'snapshot') {
+      const payload = message.payload || {}
       printerRuntimeState = {
         ...printerRuntimeState,
-        ...message.payload,
+        ...payload,
+      }
+      printerSnapshotState = {
+        ...printerSnapshotState,
+        updatedAt: String(payload?.changedAt || new Date().toISOString()),
+        backupDir: String(payload?.backupDir || printerSnapshotState.backupDir || ''),
+        installedPrinters: Array.isArray(payload?.installedPrinters) ? payload.installedPrinters : printerSnapshotState.installedPrinters,
+        driverIndexEntries: Array.isArray(payload?.driverIndexEntries) ? payload.driverIndexEntries : printerSnapshotState.driverIndexEntries,
+        printerManage: Array.isArray(payload?.printerManage) ? payload.printerManage : printerSnapshotState.printerManage,
+        spooler: String(payload?.spooler || printerSnapshotState.spooler || 'unknown'),
+        ports: Array.isArray(payload?.ports) ? payload.ports : printerSnapshotState.ports,
+        changes: payload?.changes || printerSnapshotState.changes,
       }
       broadcastPrinterState()
-      if (hasSnapshotRuntimeStructuralChanges(message?.payload?.changes || {})) {
-        schedulePrinterSnapshotRefresh(800)
-      }
+      broadcastPrinterSnapshot()
       return
     }
     if (type === 'error') {
@@ -241,13 +299,31 @@ function startPrinterStateWorker() {
   })
 
   printerStateWorker.on('exit', (code) => {
+    printerStateWorkerStarting = false
     printerStateWorker = null
     if (!appIsQuitting && code !== 0) {
       setTimeout(() => {
-        startPrinterStateWorker()
+        createPrinterStateWorker({ backupDir: printerSnapshotState.backupDir })
       }, 1200)
     }
   })
+}
+
+function startPrinterStateWorker({ backupDir = '' } = {}) {
+  if (printerStateWorker || printerStateWorkerStarting || appIsQuitting) return
+  printerStateWorkerStarting = true
+  setTimeout(() => {
+    if (printerStateWorker || appIsQuitting) {
+      printerStateWorkerStarting = false
+      return
+    }
+    try {
+      createPrinterStateWorker({ backupDir })
+    } catch (error) {
+      printerStateWorkerStarting = false
+      logWarn(`[printer-state] start failed: ${error?.message || error}`)
+    }
+  }, 0)
 }
 
 function getResourceRootPath() {
@@ -497,6 +573,60 @@ function sanitizeBackupDirPath(rawPath) {
   }
 
   return text
+}
+
+async function isDirectoryPath(targetPath) {
+  const value = sanitizeBackupDirPath(targetPath)
+  if (!value) return false
+  try {
+    const stat = await fs.stat(value)
+    return stat.isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function getOrderedNonSystemDriveLetters() {
+  const letters = []
+  for (let code = 68; code <= 90; code += 1) {
+    letters.push(String.fromCharCode(code))
+  }
+  for (let code = 65; code <= 66; code += 1) {
+    letters.push(String.fromCharCode(code))
+  }
+  return letters.filter((letter) => letter !== 'C')
+}
+
+async function resolveForcedStartupBackupDir() {
+  if (process.platform !== 'win32') {
+    return getDefaultBackupDir()
+  }
+
+  for (const letter of getOrderedNonSystemDriveLetters()) {
+    const root = `${letter}:\\`
+    if (await isDirectoryPath(root)) {
+      return path.join(root, 'hstool', 'driver', 'printer')
+    }
+  }
+  return path.join('C:\\', 'hstool', 'driver', 'printer')
+}
+
+async function ensureStartupBackupDirSetting(settings = {}) {
+  const currentBackupDir = sanitizeBackupDirPath(settings?.backupDir)
+  if (currentBackupDir && await isDirectoryPath(currentBackupDir)) {
+    return {
+      ...settings,
+      backupDir: currentBackupDir,
+    }
+  }
+
+  const forcedBackupDir = await resolveForcedStartupBackupDir()
+  await fs.mkdir(forcedBackupDir, { recursive: true })
+  const saved = await writeSettings({
+    ...settings,
+    backupDir: forcedBackupDir,
+  })
+  return saved
 }
 
 function resolveBackupDirPath(backupDir, fallbackBackupDir = '') {
@@ -892,10 +1022,16 @@ async function readSettings() {
     const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
     feature.lan.discoveryEnabled = lanEnabled
     const backupDir = resolveBackupDirPath(parsed?.backupDir)
+    const printServiceEnabled = toBool(parsed?.printServiceEnabled, false)
+    const printServicePort = normalizePrintServicePort(parsed?.printServicePort, DEFAULT_PRINT_SERVICE_PORT)
+    const printServiceAuthToken = String(parsed?.printServiceAuthToken || '').trim()
     return {
       backupDir,
       themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
       lanEnabled,
+      printServiceEnabled,
+      printServicePort,
+      printServiceAuthToken,
       feature,
     }
   } catch {
@@ -904,6 +1040,9 @@ async function readSettings() {
       backupDir: getDefaultBackupDir(),
       themeMode: 'system',
       lanEnabled: feature.lan.discoveryEnabled,
+      printServiceEnabled: false,
+      printServicePort: DEFAULT_PRINT_SERVICE_PORT,
+      printServiceAuthToken: '',
       feature,
     }
   }
@@ -916,11 +1055,21 @@ async function writeSettings(nextSettings) {
     ? nextSettings.lanEnabled
     : toBool(current?.lanEnabled, nextFeature.lan.discoveryEnabled)
   nextFeature.lan.discoveryEnabled = lanEnabled
+  const printServiceEnabled = typeof nextSettings?.printServiceEnabled === 'boolean'
+    ? nextSettings.printServiceEnabled
+    : toBool(current?.printServiceEnabled, false)
+  const printServicePort = normalizePrintServicePort(nextSettings?.printServicePort, current?.printServicePort)
+  const printServiceAuthToken = nextSettings?.printServiceAuthToken !== undefined
+    ? String(nextSettings.printServiceAuthToken || '').trim()
+    : String(current?.printServiceAuthToken || '').trim()
   const backupDir = resolveBackupDirPath(nextSettings?.backupDir, current?.backupDir)
   const merged = {
     backupDir,
     themeMode: THEME_MODES.has(nextSettings.themeMode) ? nextSettings.themeMode : current.themeMode || 'system',
     lanEnabled,
+    printServiceEnabled,
+    printServicePort,
+    printServiceAuthToken,
     feature: nextFeature,
   }
 
@@ -1358,6 +1507,38 @@ async function applyLanSettings(settings = {}) {
   return runtime.getState()
 }
 
+function ensurePrintSocketService() {
+  if (printSocketService) return printSocketService
+  printSocketService = createPrintSocketService({
+    appVersion: app.getVersion(),
+    onListPrinters: async () => getInstalledPrinters(),
+    onStateChanged: (state) => {
+      broadcastPrintServiceState(state)
+    },
+    onJobUpdated: (job) => {
+      broadcastPrintJob(job)
+    },
+    onError: (error) => {
+      logWarn(`[print-service] ${error?.message || error}`)
+    },
+  })
+  return printSocketService
+}
+
+async function applyPrintServiceSettings(settings = {}) {
+  const runtime = ensurePrintSocketService()
+  await runtime.applySettings({
+    port: settings?.printServicePort,
+    authToken: settings?.printServiceAuthToken,
+  })
+  if (toBool(settings?.printServiceEnabled, false)) {
+    await runtime.start()
+  } else {
+    await runtime.stop()
+  }
+  return runtime.getState()
+}
+
 async function getInstalledPrinters() {
   const script = await loadPsScript('printer-list-installed')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
@@ -1395,8 +1576,16 @@ async function refreshPrinterSnapshot({ broadcast = true } = {}) {
 
   printerSnapshotRefreshRunning = true
   try {
-    const nextSnapshot = await buildPrinterSnapshot()
-    printerSnapshotState = nextSnapshot
+    requestPrinterStateRefresh()
+    if (!printerSnapshotState.updatedAt) {
+      try {
+        const nextSnapshot = await buildPrinterSnapshot()
+        printerSnapshotState = {
+          ...printerSnapshotState,
+          ...nextSnapshot,
+        }
+      } catch {}
+    }
     if (broadcast) {
       broadcastPrinterSnapshot()
     }
@@ -1534,6 +1723,10 @@ async function installPrinterFromArchive({
     portHostAddress: String(entry?.portHostAddress || '').trim(),
     infRelativePath: String(entry?.infRelativePath || '').trim(),
     archiveSha256: String(entry?.archiveSha256 || '').trim().toLowerCase(),
+    usbVid: String(entry?.usbVid || '').trim().toUpperCase(),
+    usbPid: String(entry?.usbPid || '').trim().toUpperCase(),
+    usbVidPid: String(entry?.usbVidPid || '').trim().toUpperCase(),
+    deviceSerial: String(entry?.deviceSerial || '').trim(),
   }
   const normalizedArchivePath = String(archivePath || '').trim()
   if (!normalizedArchivePath) {
@@ -1552,6 +1745,16 @@ async function installPrinterFromArchive({
 
   const effectivePrinterName = String(targetPrinterName || '').trim() || normalizedEntry.printerName
   const effectivePortHostAddress = String(portHostAddressOverride || '').trim() || normalizedEntry.portHostAddress
+  const hasUsbIdentity = Boolean(
+    normalizedEntry.usbVidPid
+    || (normalizedEntry.usbVid && normalizedEntry.usbPid)
+    || normalizedEntry.deviceSerial,
+  )
+  const isUsbProfile = /^usb/i.test(normalizedEntry.portName) || hasUsbIdentity
+  const preferredPortForInstall = isUsbProfile
+    ? (normalizedEntry.portName || 'USB')
+    : (normalizedEntry.portName || '')
+  const preferredPortHostForInstall = isUsbProfile ? '' : effectivePortHostAddress
 
   let backupPath = ''
   let extractDir = ''
@@ -1604,8 +1807,8 @@ async function installPrinterFromArchive({
   const script = await loadPsScript('printer-install-from-backup', {
     PRINTER_NAME: toPsSingleQuote(effectivePrinterName),
     EXPECTED_DRIVER_NAME: toPsSingleQuote(normalizedEntry.driverName),
-    PREFERRED_PORT: toPsSingleQuote(normalizedEntry.portName || ''),
-    PREFERRED_PORT_HOST: toPsSingleQuote(effectivePortHostAddress),
+    PREFERRED_PORT: toPsSingleQuote(preferredPortForInstall),
+    PREFERRED_PORT_HOST: toPsSingleQuote(preferredPortHostForInstall),
     INF_PATH: toPsSingleQuote(infPath),
     BACKUP_PATH: toPsSingleQuote(backupPath),
   })
@@ -2035,11 +2238,22 @@ if (!gotSingleInstanceLock) {
 
   app.whenReady().then(async () => {
     registerCustomProtocolClient()
-    const startupSettings = await readSettings()
+    let startupSettings = await readSettings()
+    startupSettings = await ensureStartupBackupDirSetting(startupSettings)
+    await ensureBackupIndex(startupSettings.backupDir)
+    printerSnapshotState = {
+      ...printerSnapshotState,
+      backupDir: startupSettings.backupDir,
+    }
     try {
       await applyLanSettings(startupSettings)
     } catch (error) {
       logWarn(`[lan-runtime] apply startup settings failed: ${error?.message || error}`)
+    }
+    try {
+      await applyPrintServiceSettings(startupSettings)
+    } catch (error) {
+      logWarn(`[print-service] apply startup settings failed: ${error?.message || error}`)
     }
 
     upsertIpcHandler('app:get-version', () => app.getVersion())
@@ -2052,6 +2266,8 @@ if (!gotSingleInstanceLock) {
       const writableBackupDir = await ensureWritableBackupDir(backupDir)
       const saved = await writeSettings({ backupDir: writableBackupDir })
       await ensureBackupIndex(saved.backupDir)
+      updatePrinterStateWorkerConfig({ backupDir: saved.backupDir })
+      requestPrinterStateRefresh()
       await refreshPrinterSnapshot({ broadcast: true })
       return saved
     })
@@ -2126,6 +2342,44 @@ if (!gotSingleInstanceLock) {
     upsertIpcHandler('lan:cancel-task', async (_, payload) => {
       const runtime = ensureLanRuntime()
       return runtime.cancelTask(payload?.taskId)
+    })
+
+    upsertIpcHandler('print:service:get-state', async () => {
+      const runtime = ensurePrintSocketService()
+      return runtime.getState()
+    })
+    upsertIpcHandler('print:service:set-enabled', async (_, payload) => {
+      const enabled = toBool(payload?.enabled, false)
+      const saved = await writeSettings({
+        printServiceEnabled: enabled,
+        printServicePort: payload?.port,
+        printServiceAuthToken: payload?.authToken,
+      })
+      return applyPrintServiceSettings(saved)
+    })
+    upsertIpcHandler('print:service:get-client-info', async () => {
+      const runtime = ensurePrintSocketService()
+      return runtime.getClientInfo()
+    })
+    upsertIpcHandler('print:service:get-printer-list', async () => {
+      const runtime = ensurePrintSocketService()
+      return runtime.getPrinterList()
+    })
+    upsertIpcHandler('print:service:list-jobs', async () => {
+      const runtime = ensurePrintSocketService()
+      return runtime.listJobs()
+    })
+    upsertIpcHandler('print:service:get-job', async (_, payload) => {
+      const runtime = ensurePrintSocketService()
+      return runtime.getJob(payload?.taskId)
+    })
+    upsertIpcHandler('print:service:submit-job', async (_, payload) => {
+      const runtime = ensurePrintSocketService()
+      return runtime.submitJob(payload || {})
+    })
+    upsertIpcHandler('print:service:reprint', async (_, payload) => {
+      const runtime = ensurePrintSocketService()
+      return runtime.reprint(payload?.taskId)
     })
 
     upsertIpcHandler('printers:list-installed', async () => getInstalledPrinters())
@@ -2238,7 +2492,7 @@ if (!gotSingleInstanceLock) {
 
     createMainWindow()
     createTray()
-    startPrinterStateWorker()
+    startPrinterStateWorker({ backupDir: startupSettings.backupDir })
     void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
       logWarn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
     })
@@ -2262,6 +2516,9 @@ if (!gotSingleInstanceLock) {
     stopPrinterStateWorker()
     if (lanRuntime) {
       void lanRuntime.dispose()
+    }
+    if (printSocketService) {
+      void printSocketService.dispose()
     }
   })
 

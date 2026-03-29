@@ -78,6 +78,31 @@ function createEmptyLanState() {
   }
 }
 
+function createEmptyPrintServiceState() {
+  return {
+    enabled: false,
+    port: 17521,
+    socketProtocolVersion: 1,
+    running: false,
+    clients: 0,
+    updatedAt: '',
+  }
+}
+
+function normalizePrintJob(item = {}) {
+  return {
+    taskId: String(item?.taskId || ''),
+    templateId: String(item?.templateId || ''),
+    type: String(item?.type || ''),
+    status: String(item?.status || ''),
+    printer: String(item?.printer || ''),
+    errorCode: String(item?.errorCode || ''),
+    errorMessage: String(item?.errorMessage || ''),
+    createdAt: String(item?.createdAt || ''),
+    updatedAt: String(item?.updatedAt || ''),
+  }
+}
+
 function normalizeName(value) {
   return String(value || '').trim()
 }
@@ -374,6 +399,7 @@ export const useRuntimeStore = defineStore('runtime', {
       backupDir: '',
       themeMode: DEFAULT_THEME_MODE,
       lanEnabled: false,
+      printServiceEnabled: false,
       feature: normalizeFeatureSettings(),
     },
     PrinterServerManage: createEmptyPrinterServerManage(),
@@ -382,6 +408,9 @@ export const useRuntimeStore = defineStore('runtime', {
     lanOffers: [],
     lanTasks: [],
     lanPairState: createEmptyLanPairState(),
+    printServiceState: createEmptyPrintServiceState(),
+    printJobs: [],
+    printProtocolVersion: 1,
     usbPorts: [],
     busy: {
       refreshing: false,
@@ -407,6 +436,7 @@ export const useRuntimeStore = defineStore('runtime', {
         backupDir: String(settings?.backupDir || ''),
         themeMode: String(settings?.themeMode || DEFAULT_THEME_MODE),
         lanEnabled,
+        printServiceEnabled: toBool(settings?.printServiceEnabled ?? this.settings?.printServiceEnabled),
         feature,
       }
       this.settingsLoaded = true
@@ -460,7 +490,66 @@ export const useRuntimeStore = defineStore('runtime', {
       }
       this.lastSyncAt = new Date().toISOString()
     },
+    setPrintServiceState(payload = {}) {
+      const nextState = {
+        ...createEmptyPrintServiceState(),
+        ...payload,
+      }
+      nextState.port = Number(nextState.port) || 17521
+      nextState.socketProtocolVersion = Number(nextState.socketProtocolVersion) || 1
+      nextState.clients = Number(nextState.clients) || 0
+      nextState.enabled = Boolean(nextState.enabled)
+      nextState.running = Boolean(nextState.running)
+
+      this.printServiceState = nextState
+      this.printProtocolVersion = nextState.socketProtocolVersion
+      this.settings = {
+        ...this.settings,
+        printServiceEnabled: nextState.enabled,
+      }
+      this.lastSyncAt = new Date().toISOString()
+    },
+    setPrintJobs(list = []) {
+      const normalized = (Array.isArray(list) ? list : [])
+        .map((item) => normalizePrintJob(item))
+        .filter((item) => item.taskId)
+        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+      this.printJobs = normalized
+      this.lastSyncAt = new Date().toISOString()
+    },
+    upsertPrintJob(job = {}) {
+      const normalized = normalizePrintJob(job)
+      if (!normalized.taskId) return
+      const nextMap = new Map(this.printJobs.map((item) => [item.taskId, item]))
+      nextMap.set(normalized.taskId, normalized)
+      this.printJobs = [...nextMap.values()].sort((a, b) =>
+        String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+      this.lastSyncAt = new Date().toISOString()
+    },
     setPrinterSnapshot(payload = {}) {
+      const workerManagedRows = Array.isArray(payload?.printerManage) ? payload.printerManage : []
+      if (workerManagedRows.length || payload?.fromWorker) {
+        const spooler = String(payload?.spooler || this.PrinterServerManage?.spooler || 'unknown')
+        const ports = Array.isArray(payload?.ports) ? payload.ports : this.PrinterServerManage?.ports || []
+        const changes = {
+          ...createEmptyChanges(),
+          ...(this.PrinterServerManage?.changes || {}),
+          ...(payload?.changes || {}),
+        }
+        this.settings = {
+          ...this.settings,
+          backupDir: String(payload?.backupDir || this.settings.backupDir || ''),
+        }
+        this.PrinterServerManage = {
+          spooler,
+          ports,
+          changes,
+          printers: sortPrinters(workerManagedRows.map((row) => ({ ...row }))),
+        }
+        this.lastSyncAt = new Date().toISOString()
+        return
+      }
+
       const installed = Array.isArray(payload?.installedPrinters) ? payload.installedPrinters : []
       const indexEntries = Array.isArray(payload?.driverIndexEntries) ? payload.driverIndexEntries : []
       const previousPrinters = Array.isArray(this.PrinterServerManage?.printers) ? this.PrinterServerManage.printers : []
@@ -517,6 +606,22 @@ export const useRuntimeStore = defineStore('runtime', {
       this.lastSyncAt = new Date().toISOString()
     },
     setPrinterRuntimeState(state = {}) {
+      const workerManagedRows = Array.isArray(state?.printerManage) ? state.printerManage : []
+      if (workerManagedRows.length || state?.fromWorker) {
+        this.PrinterServerManage = {
+          spooler: String(state?.spooler || this.PrinterServerManage?.spooler || 'unknown'),
+          ports: Array.isArray(state?.ports) ? state.ports : this.PrinterServerManage?.ports || [],
+          changes: {
+            ...createEmptyChanges(),
+            ...(this.PrinterServerManage?.changes || {}),
+            ...(state?.changes || {}),
+          },
+          printers: sortPrinters(workerManagedRows.map((row) => ({ ...row }))),
+        }
+        this.lastSyncAt = new Date().toISOString()
+        return
+      }
+
       const currentPrinters = Array.isArray(this.PrinterServerManage?.printers) ? this.PrinterServerManage.printers : []
       const runtimePrinters = Array.isArray(state?.printers) ? state.printers : []
       const nextPrinters = currentPrinters.map((item) => ({ ...item }))
@@ -683,6 +788,9 @@ export const useRuntimeStore = defineStore('runtime', {
       this.lanOffers = []
       this.lanTasks = []
       this.lanPairState = createEmptyLanPairState()
+      this.printServiceState = createEmptyPrintServiceState()
+      this.printJobs = []
+      this.printProtocolVersion = 1
       this.usbPorts = []
       this.lastSyncAt = ''
     },

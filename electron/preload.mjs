@@ -14,6 +14,14 @@ contextBridge.exposeInMainWorld('eleDrive', {
   requestLanInstall: (payload) => ipcRenderer.invoke('lan:request-install', payload),
   getLanTask: (payload) => ipcRenderer.invoke('lan:get-task', payload),
   cancelLanTask: (payload) => ipcRenderer.invoke('lan:cancel-task', payload),
+  getPrintServiceState: () => ipcRenderer.invoke('print:service:get-state'),
+  setPrintServiceEnabled: (payload) => ipcRenderer.invoke('print:service:set-enabled', payload),
+  getPrintClientInfo: () => ipcRenderer.invoke('print:service:get-client-info'),
+  getPrintPrinterList: () => ipcRenderer.invoke('print:service:get-printer-list'),
+  listPrintJobs: () => ipcRenderer.invoke('print:service:list-jobs'),
+  getPrintJob: (payload) => ipcRenderer.invoke('print:service:get-job', payload),
+  submitPrintJob: (payload) => ipcRenderer.invoke('print:service:submit-job', payload),
+  reprintJob: (payload) => ipcRenderer.invoke('print:service:reprint', payload),
   listInstalledPrinters: () => ipcRenderer.invoke('printers:list-installed'),
   getPrinterSnapshot: () => ipcRenderer.invoke('printers:snapshot:get'),
   listUsbPrinterPorts: () => ipcRenderer.invoke('printers:list-usb-ports'),
@@ -51,5 +59,17 @@ contextBridge.exposeInMainWorld('eleDrive', {
     const listener = (_, payload) => handler(payload)
     ipcRenderer.on('lan:state-updated', listener)
     return () => ipcRenderer.removeListener('lan:state-updated', listener)
+  },
+  onPrintServiceStateUpdated: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('print:service:state-updated', listener)
+    return () => ipcRenderer.removeListener('print:service:state-updated', listener)
+  },
+  onPrintJobUpdated: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('print:job-updated', listener)
+    return () => ipcRenderer.removeListener('print:job-updated', listener)
   },
 })

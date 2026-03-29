@@ -104,6 +104,7 @@ const networkDriverRows = computed(() => {
         task,
       }
     })
+    .filter((row) => !row.installed)
     .sort((a, b) => String(a.printerName || '').localeCompare(String(b.printerName || '')))
 })
 const networkDriverEmptyText = computed(() => {
@@ -968,6 +969,11 @@ function applyPrinterSnapshot(payload) {
     installedPrinters: Array.isArray(payload?.installedPrinters) ? payload.installedPrinters : [],
     driverIndexEntries: Array.isArray(payload?.driverIndexEntries) ? payload.driverIndexEntries : [],
     backupDir: String(payload?.backupDir || ''),
+    printerManage: Array.isArray(payload?.printerManage) ? payload.printerManage : [],
+    spooler: String(payload?.spooler || ''),
+    ports: Array.isArray(payload?.ports) ? payload.ports : [],
+    changes: payload?.changes || {},
+    fromWorker: true,
   })
   refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
   reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
@@ -1046,7 +1052,10 @@ async function handlePrinterStateUpdated(payload) {
     tryFinishFirstScreenLoading()
   }
   if (savingAction.value) return
-  runtimeStore.setPrinterRuntimeState(payload)
+  runtimeStore.setPrinterRuntimeState({
+    ...(payload || {}),
+    fromWorker: true,
+  })
   refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
 }
 

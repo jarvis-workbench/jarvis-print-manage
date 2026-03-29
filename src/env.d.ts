@@ -4,6 +4,8 @@ interface EleDriveSettings {
   backupDir: string
   themeMode: ThemeMode
   lanEnabled?: boolean
+  printServiceEnabled?: boolean
+  printServicePort?: number
   feature?: {
     backup?: {
       archiveEnabled?: boolean
@@ -84,6 +86,27 @@ interface LanRuntimeState {
   offers: RemotePrinterOffer[]
   tasks: LanTask[]
   pairState: LanPairState
+  updatedAt: string
+}
+
+interface PrintServiceState {
+  enabled: boolean
+  port: number
+  socketProtocolVersion: number
+  running: boolean
+  clients: number
+  updatedAt: string
+}
+
+interface PrintJob {
+  taskId: string
+  templateId: string
+  type: 'html' | 'pdf' | 'url_pdf' | 'blob_pdf' | 'render-jpeg' | 'render-pdf' | 'render-print'
+  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELED'
+  printer: string
+  errorCode: string
+  errorMessage: string
+  createdAt: string
   updatedAt: string
 }
 
@@ -211,6 +234,39 @@ interface Window {
     }>
     getLanTask: (payload: { taskId: string }) => Promise<LanTask>
     cancelLanTask: (payload: { taskId: string }) => Promise<LanTask>
+    getPrintServiceState: () => Promise<PrintServiceState>
+    setPrintServiceEnabled: (payload: {
+      enabled: boolean
+      port?: number
+      authToken?: string
+    }) => Promise<PrintServiceState>
+    getPrintClientInfo: () => Promise<{
+      machineName: string
+      appVersion: string
+      arch: string
+      socketProtocolVersion: number
+      running: boolean
+      port: number
+      updatedAt: string
+    }>
+    getPrintPrinterList: () => Promise<Array<{
+      name: string
+      driverName: string
+      portName: string
+      printerStatus?: string | number
+      workOffline?: boolean
+      shared?: boolean
+      shareName?: string
+    }>>
+    listPrintJobs: () => Promise<PrintJob[]>
+    getPrintJob: (payload: { taskId: string }) => Promise<PrintJob>
+    submitPrintJob: (payload: {
+      templateId?: string
+      type: PrintJob['type']
+      printer?: string
+      options?: Record<string, unknown>
+    }) => Promise<PrintJob>
+    reprintJob: (payload: { taskId: string }) => Promise<PrintJob>
     listInstalledPrinters: () => Promise<InstalledPrinter[]>
     getPrinterSnapshot: () => Promise<PrinterSnapshotPayload>
     listUsbPrinterPorts: () => Promise<string[]>
@@ -279,5 +335,7 @@ interface Window {
     onPrinterStateUpdated: (handler: (payload: PrinterRuntimeState | null) => void) => () => void
     onPrinterSnapshotUpdated: (handler: (payload: PrinterSnapshotPayload | null) => void) => () => void
     onLanStateUpdated: (handler: (payload: LanRuntimeState | null) => void) => () => void
+    onPrintServiceStateUpdated: (handler: (payload: PrintServiceState | null) => void) => () => void
+    onPrintJobUpdated: (handler: (payload: PrintJob | null) => void) => () => void
   }
 }
