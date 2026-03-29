@@ -32,15 +32,20 @@ const error = ref('')
 const message = ref('')
 const lanLoading = ref(false)
 const requestingLanInstallKeys = ref(new Set())
+const manualRefreshLoading = ref(false)
+const manualRefreshRunning = ref(false)
 const firstScreenLoading = ref(true)
 const firstSnapshotReady = ref(false)
 const firstRuntimeReady = ref(false)
 const firstLoadStartedAt = ref(Date.now())
 let firstLoadForceDoneTimer = null
 let firstLoadMinDelayTimer = null
+let manualRefreshFeedbackTimer = null
+let manualRefreshFeedbackSeq = 0
 
 const FIRST_LOAD_MIN_MS = 450
 const FIRST_LOAD_FORCE_DONE_MS = 15_000
+const MANUAL_REFRESH_FEEDBACK_MIN_MS = 700
 
 const runtimeStore = useRuntimeStore()
 const { settings, PrinterServerManage, lanState, lanNodes, lanOffers, lanTasks } = storeToRefs(runtimeStore)
@@ -142,6 +147,36 @@ function clearFirstLoadTimers() {
     clearTimeout(firstLoadMinDelayTimer)
     firstLoadMinDelayTimer = null
   }
+}
+
+function beginManualRefreshFeedback() {
+  manualRefreshFeedbackSeq += 1
+  if (manualRefreshFeedbackTimer) {
+    clearTimeout(manualRefreshFeedbackTimer)
+    manualRefreshFeedbackTimer = null
+  }
+  manualRefreshLoading.value = true
+  return {
+    seq: manualRefreshFeedbackSeq,
+    startedAt: Date.now(),
+  }
+}
+
+function finishManualRefreshFeedback(feedback = null) {
+  const seq = Number(feedback?.seq || 0)
+  const startedAt = Number(feedback?.startedAt || 0)
+  const elapsed = Math.max(0, Date.now() - startedAt)
+  const remain = Math.max(0, MANUAL_REFRESH_FEEDBACK_MIN_MS - elapsed)
+  if (manualRefreshFeedbackTimer) {
+    clearTimeout(manualRefreshFeedbackTimer)
+    manualRefreshFeedbackTimer = null
+  }
+  manualRefreshFeedbackTimer = setTimeout(() => {
+    if (seq === manualRefreshFeedbackSeq) {
+      manualRefreshLoading.value = false
+    }
+    manualRefreshFeedbackTimer = null
+  }, remain)
 }
 
 function tryFinishFirstScreenLoading(force = false) {
@@ -881,8 +916,9 @@ function applyLanState(payload) {
 }
 
 async function refreshLanState(options = {}) {
-  if (!window.eleDrive?.getLanState) return
+  if (!window.eleDrive?.getLanState) return false
   const silent = Boolean(options?.silent)
+  let success = true
   if (!silent) {
     lanLoading.value = true
   }
@@ -897,6 +933,7 @@ async function refreshLanState(options = {}) {
     }
     applyLanState(state || {})
   } catch (err) {
+    success = false
     if (!silent) {
       const detail = err instanceof Error ? err.message : String(err)
       error.value = detail
@@ -906,6 +943,7 @@ async function refreshLanState(options = {}) {
       lanLoading.value = false
     }
   }
+  return success
 }
 
 function subscribeLanState() {
@@ -1149,8 +1187,9 @@ async function fetchLegacySnapshotPayload() {
 
 async function loadPrinters(options = {}) {
   const silent = Boolean(options?.silent)
-  if (!window.eleDrive?.getPrinterSnapshot && !window.eleDrive?.listInstalledPrinters) return
+  if (!window.eleDrive?.getPrinterSnapshot && !window.eleDrive?.listInstalledPrinters) return false
   const seq = ++loadPrintersSeq
+  let success = true
   if (!silent) {
     loading.value = true
     error.value = ''
@@ -1175,10 +1214,11 @@ async function loadPrinters(options = {}) {
     if (!payload) {
       throw new Error('无法获取打印机快照数据')
     }
-    if (seq !== loadPrintersSeq) return
+    if (seq !== loadPrintersSeq) return false
     applyPrinterSnapshot(payload)
   } catch (err) {
-    if (seq !== loadPrintersSeq) return
+    success = false
+    if (seq !== loadPrintersSeq) return false
     if (!silent) {
       error.value = err instanceof Error ? err.message : String(err)
     }
@@ -1192,6 +1232,33 @@ async function loadPrinters(options = {}) {
       loading.value = false
       loadingOwnerSeq = 0
     }
+  }
+  return success
+}
+
+async function handleManualRefresh() {
+  const feedback = beginManualRefreshFeedback()
+  if (manualRefreshRunning.value) {
+    ElMessage.info('正在刷新，请稍候...')
+    finishManualRefreshFeedback(feedback)
+    return
+  }
+  manualRefreshRunning.value = true
+  let printerOk = false
+  let lanOk = true
+  try {
+    printerOk = await loadPrinters({ silent: false })
+    if (String(activePrinterTab.value || '') === 'network-driver') {
+      lanOk = await refreshLanState({ silent: false })
+    }
+  } finally {
+    manualRefreshRunning.value = false
+    finishManualRefreshFeedback(feedback)
+  }
+  if (printerOk && lanOk) {
+    ElMessage.success('刷新成功')
+  } else {
+    ElMessage.warning('刷新完成，部分数据刷新失败')
   }
 }
 
@@ -1553,6 +1620,12 @@ onMounted(() => {
 
 onUnmounted(() => {
   clearFirstLoadTimers()
+  if (manualRefreshFeedbackTimer) {
+    clearTimeout(manualRefreshFeedbackTimer)
+    manualRefreshFeedbackTimer = null
+  }
+  manualRefreshLoading.value = false
+  manualRefreshRunning.value = false
   unsubscribeLanState()
   unsubscribePrinterSnapshot()
   unsubscribePrinterRuntimeState()
@@ -1583,7 +1656,11 @@ watch(activePrinterTab, (tab) => {
           <el-button type="primary" :disabled="uninstalling" @click="openAddPrinterDialog">
             <span>添加新的打印机</span>
           </el-button>
-          <el-button :loading="loading" :disabled="uninstalling" @click="loadPrinters">
+          <el-button
+            :loading="manualRefreshLoading || loading || (activePrinterTab === 'network-driver' && lanLoading)"
+            :disabled="uninstalling"
+            @click="handleManualRefresh"
+          >
             <refresh-one theme="outline" size="14" />
             <span>刷新列表</span>
           </el-button>
