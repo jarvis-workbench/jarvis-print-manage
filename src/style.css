@@ -235,9 +235,90 @@ p {
   font-size: 12px;
 }
 
-.settings-hint-top {
-  margin-top: 0;
-  margin-bottom: 12px;
+.settings-tabs {
+  margin-top: 8px;
+}
+
+.settings-lan-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 34px;
+  margin-bottom: 10px;
+}
+
+.settings-lan-toggle-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1;
+}
+
+.settings-lan-toggle-name {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+
+.settings-lan-protocol-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.settings-lan-switch {
+  flex-shrink: 0;
+}
+
+.settings-lan-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.settings-lan-header-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.settings-lan-node-id {
+  color: var(--app-muted);
+  font-size: 13px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-lan-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-lan-online-count {
+  color: var(--app-muted);
+  font-size: 13px;
+}
+
+.settings-lan-panel {
+  min-height: 220px;
+}
+
+.settings-lan-table .el-table__header-wrapper th .cell {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-lan-table .el-table__body-wrapper td .cell {
+  font-size: 14px;
 }
 
 .printer-table {
@@ -266,6 +347,10 @@ p {
 
 .printer-tabs {
   margin-top: 8px;
+}
+
+.printer-first-load-wrap {
+  min-height: 260px;
 }
 
 .printer-table .el-button {
@@ -927,4 +1012,3 @@ p {
   --el-text-color-secondary: #9fb0d8;
   --el-border-color-light: rgba(148, 163, 184, 0.24);
 }
-

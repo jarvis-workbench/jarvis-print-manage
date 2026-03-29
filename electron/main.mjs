@@ -395,7 +395,72 @@ async function openPrinterPreferencesDialog({ printerName }) {
 }
 
 function getDefaultBackupDir() {
-  return path.join(app.getPath('documents'), 'EleDrive', 'driver-backups')
+  const docsPath = sanitizeBackupDirPath(app.getPath('documents'))
+  if (docsPath) {
+    return path.join(docsPath, 'EleDrive', 'driver-backups')
+  }
+  const userDataPath = sanitizeBackupDirPath(app.getPath('userData'))
+  if (userDataPath) {
+    return path.join(userDataPath, 'driver-backups')
+  }
+  return path.join(process.cwd(), 'driver-backups')
+}
+
+function stripWindowsLongPathPrefix(rawPath) {
+  const text = String(rawPath || '').trim()
+  if (!text) return ''
+  if (process.platform !== 'win32') return text
+  if (text.startsWith('\\\\?\\UNC\\')) {
+    return `\\\\${text.slice('\\\\?\\UNC\\'.length)}`
+  }
+  if (text.startsWith('\\\\?\\')) {
+    return text.slice('\\\\?\\'.length)
+  }
+  return text
+}
+
+function sanitizeBackupDirPath(rawPath) {
+  const text = stripWindowsLongPathPrefix(rawPath).trim()
+  if (!text) return ''
+
+  if (process.platform === 'win32') {
+    const lower = text.toLowerCase()
+    if (lower === '\\\\?' || lower === '\\\\?\\' || lower === '\\?' || lower === '?') {
+      return ''
+    }
+    if (/[?*<>|"]/u.test(text)) {
+      return ''
+    }
+  }
+
+  return text
+}
+
+function resolveBackupDirPath(backupDir, fallbackBackupDir = '') {
+  const primary = sanitizeBackupDirPath(backupDir)
+  if (primary) return primary
+  const fallback = sanitizeBackupDirPath(fallbackBackupDir)
+  if (fallback) return fallback
+  return getDefaultBackupDir()
+}
+
+async function ensureWritableBackupDir(backupDir, fallbackBackupDir = '') {
+  const candidates = [
+    resolveBackupDirPath(backupDir, fallbackBackupDir),
+    getDefaultBackupDir(),
+    path.join(app.getPath('userData'), 'driver-backups'),
+  ]
+  const uniqueCandidates = [...new Set(candidates.map((item) => sanitizeBackupDirPath(item)).filter(Boolean))]
+  let lastError = null
+  for (const candidate of uniqueCandidates) {
+    try {
+      await fs.mkdir(candidate, { recursive: true })
+      return candidate
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError || new Error('No writable backup directory available.')
 }
 
 function normalizeVirtualPrinterConfig(raw = {}) {
@@ -513,18 +578,20 @@ function normalizeIndex(raw) {
 }
 
 async function writeIndexFile(backupDir, indexObj) {
+  const targetDir = resolveBackupDirPath(backupDir)
   const normalized = normalizeIndex({
     ...indexObj,
     updatedAt: new Date().toISOString(),
   })
-  await fs.mkdir(backupDir, { recursive: true })
-  await fs.writeFile(getIndexFilePath(backupDir), JSON.stringify(normalized, null, 2), 'utf-8')
+  await fs.mkdir(targetDir, { recursive: true })
+  await fs.writeFile(getIndexFilePath(targetDir), JSON.stringify(normalized, null, 2), 'utf-8')
   return normalized
 }
 
 async function readIndexFileIfExists(backupDir) {
+  const targetDir = resolveBackupDirPath(backupDir)
   try {
-    const fileText = await fs.readFile(getIndexFilePath(backupDir), 'utf-8')
+    const fileText = await fs.readFile(getIndexFilePath(targetDir), 'utf-8')
     return normalizeIndex(JSON.parse(fileText))
   } catch {
     return null
@@ -532,9 +599,10 @@ async function readIndexFileIfExists(backupDir) {
 }
 
 async function scanBackupDirForIndex(backupDir) {
+  const targetDir = resolveBackupDirPath(backupDir)
   let dirents = []
   try {
-    dirents = await fs.readdir(backupDir, { withFileTypes: true })
+    dirents = await fs.readdir(targetDir, { withFileTypes: true })
   } catch {
     return {
       version: 1,
@@ -548,7 +616,7 @@ async function scanBackupDirForIndex(backupDir) {
   for (const dirent of dirents) {
     if (!dirent.isDirectory()) continue
     const backupSubDir = dirent.name
-    const backupPath = path.join(backupDir, backupSubDir)
+    const backupPath = path.join(targetDir, backupSubDir)
     const metaPath = path.join(backupPath, BACKUP_META_FILE_NAME)
 
     try {
@@ -582,11 +650,12 @@ async function scanBackupDirForIndex(backupDir) {
 }
 
 async function ensureBackupIndex(backupDir) {
-  await fs.mkdir(backupDir, { recursive: true })
-  const existing = await readIndexFileIfExists(backupDir)
+  const targetDir = resolveBackupDirPath(backupDir)
+  await fs.mkdir(targetDir, { recursive: true })
+  const existing = await readIndexFileIfExists(targetDir)
   if (existing) return existing
-  const rebuilt = await scanBackupDirForIndex(backupDir)
-  return writeIndexFile(backupDir, rebuilt)
+  const rebuilt = await scanBackupDirForIndex(targetDir)
+  return writeIndexFile(targetDir, rebuilt)
 }
 
 async function upsertIndexEntry(backupDir, nextEntry) {
@@ -754,8 +823,9 @@ async function readSettings() {
     const feature = normalizeFeatureSettings(parsed?.feature)
     const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
     feature.lan.discoveryEnabled = lanEnabled
+    const backupDir = resolveBackupDirPath(parsed?.backupDir)
     return {
-      backupDir: parsed.backupDir || getDefaultBackupDir(),
+      backupDir,
       themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
       lanEnabled,
       feature,
@@ -778,8 +848,9 @@ async function writeSettings(nextSettings) {
     ? nextSettings.lanEnabled
     : toBool(current?.lanEnabled, nextFeature.lan.discoveryEnabled)
   nextFeature.lan.discoveryEnabled = lanEnabled
+  const backupDir = resolveBackupDirPath(nextSettings?.backupDir, current?.backupDir)
   const merged = {
-    backupDir: nextSettings.backupDir || current.backupDir || getDefaultBackupDir(),
+    backupDir,
     themeMode: THEME_MODES.has(nextSettings.themeMode) ? nextSettings.themeMode : current.themeMode || 'system',
     lanEnabled,
     feature: nextFeature,
@@ -791,7 +862,8 @@ async function writeSettings(nextSettings) {
 }
 
 function getLanConfigDirPath() {
-  return path.join(getResourceRootPath(), 'config')
+  // LAN runtime identity and task logs must be machine-local and writable.
+  return path.join(app.getPath('userData'), 'lan')
 }
 
 function ensureLanRuntime() {
@@ -840,12 +912,13 @@ async function getInstalledPrinters() {
 
 async function buildPrinterSnapshot() {
   const settings = await readSettings()
-  const indexObj = await ensureBackupIndex(settings.backupDir)
-  const normalizedIndex = await normalizeIndexDriverVersions(settings.backupDir, indexObj)
+  const backupDir = await ensureWritableBackupDir(settings.backupDir)
+  const indexObj = await ensureBackupIndex(backupDir)
+  const normalizedIndex = await normalizeIndexDriverVersions(backupDir, indexObj)
   const installedPrinters = await getInstalledPrinters()
   return {
     updatedAt: new Date().toISOString(),
-    backupDir: settings.backupDir,
+    backupDir,
     installedPrinters,
     driverIndexEntries: Array.isArray(normalizedIndex?.entries) ? normalizedIndex.entries : [],
   }
@@ -901,8 +974,7 @@ async function listUsbPrinterPorts() {
 }
 
 async function backupPrinterDriver({ printerName, backupDir }) {
-  const targetRoot = backupDir || getDefaultBackupDir()
-  await fs.mkdir(targetRoot, { recursive: true })
+  const targetRoot = await ensureWritableBackupDir(backupDir)
 
   const script = await loadPsScript('printer-backup-driver', {
     PRINTER_NAME: toPsSingleQuote(printerName),
@@ -984,7 +1056,8 @@ async function installPrinterFromBackup({
   targetPrinterName = '',
   portHostAddressOverride = '',
 }) {
-  const indexObj = await ensureBackupIndex(backupDir)
+  const resolvedBackupDir = await ensureWritableBackupDir(backupDir)
+  const indexObj = await ensureBackupIndex(resolvedBackupDir)
   const normalizedPrinterName = String(printerName || '').trim().toLowerCase()
   const entry = indexObj.entries.find((item) => item.printerName === printerName)
     || indexObj.entries.find((item) => item.printerName.toLowerCase() === normalizedPrinterName)
@@ -994,7 +1067,7 @@ async function installPrinterFromBackup({
   const effectivePrinterName = String(targetPrinterName || '').trim() || entry.printerName
   const effectivePortHostAddress = String(portHostAddressOverride || '').trim() || String(entry.portHostAddress || '')
 
-  const archivePath = resolveEntryArchivePath(backupDir, entry)
+  const archivePath = resolveEntryArchivePath(resolvedBackupDir, entry)
   if (!archivePath) {
     throw createArchiveError('ARCHIVE_NOT_FOUND', `备份索引缺少压缩包路径：${entry.printerName}`)
   }
@@ -1049,7 +1122,7 @@ async function installPrinterFromBackup({
       infPath = path.join(backupPath, fallbackInf)
 
       // Backfill index entry when older records miss INF relative path.
-      await upsertIndexEntry(backupDir, {
+      await upsertIndexEntry(resolvedBackupDir, {
         ...entry,
         infRelativePath: fallbackInf,
       })
@@ -1111,7 +1184,7 @@ async function deleteBackupDriver({ printerName, backupDir }) {
   if (!targetPrinterName) {
     throw new Error('Printer name is required.')
   }
-  const targetRoot = backupDir || getDefaultBackupDir()
+  const targetRoot = await ensureWritableBackupDir(backupDir)
   const indexObj = await ensureBackupIndex(targetRoot)
   const targetKey = targetPrinterName.toLowerCase()
   const removedIndex = indexObj.entries.findIndex((entry) => String(entry?.printerName || '').trim().toLowerCase() === targetKey)
@@ -1340,6 +1413,16 @@ function createTray() {
       label: '系统设置',
       click: () => showMainWindow('/settings'),
     },
+    {
+      type: 'separator',
+    },
+    {
+      label: '退出',
+      click: () => {
+        appIsQuitting = true
+        app.quit()
+      },
+    },
   ])
 
   tray.setContextMenu(contextMenu)
@@ -1460,7 +1543,8 @@ if (!gotSingleInstanceLock) {
       if (!backupDir || typeof backupDir !== 'string') {
         throw new Error('Invalid backup directory path.')
       }
-      const saved = await writeSettings({ backupDir })
+      const writableBackupDir = await ensureWritableBackupDir(backupDir)
+      const saved = await writeSettings({ backupDir: writableBackupDir })
       await ensureBackupIndex(saved.backupDir)
       await refreshPrinterSnapshot({ broadcast: true })
       return saved
@@ -1483,11 +1567,10 @@ if (!gotSingleInstanceLock) {
     })
     upsertIpcHandler('settings:open-backup-dir', async () => {
       const settings = await readSettings()
-      const backupDir = String(settings?.backupDir || '').trim()
+      const backupDir = await ensureWritableBackupDir(settings?.backupDir)
       if (!backupDir) {
         throw new Error('备份目录未配置')
       }
-      await fs.mkdir(backupDir, { recursive: true })
       const openResult = await shell.openPath(backupDir)
       if (openResult) {
         throw new Error(openResult)
@@ -1663,6 +1746,10 @@ if (!gotSingleInstanceLock) {
 
   app.on('before-quit', () => {
     appIsQuitting = true
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
     stopPrinterStateWorker()
     if (lanRuntime) {
       void lanRuntime.dispose()

@@ -79,6 +79,38 @@ function sortTasks(list = []) {
   return [...list].sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
 }
 
+function parseIpv4ToInt(ip) {
+  const text = String(ip || '').trim()
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return null
+  const parts = text.split('.').map((item) => Number(item))
+  if (parts.some((num) => !Number.isInteger(num) || num < 0 || num > 255)) return null
+  return ((((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0)
+}
+
+function formatIpv4FromInt(value) {
+  const num = Number(value >>> 0)
+  return `${(num >>> 24) & 255}.${(num >>> 16) & 255}.${(num >>> 8) & 255}.${num & 255}`
+}
+
+function buildBroadcastTargets() {
+  const targets = new Set(['255.255.255.255'])
+  const netMap = os.networkInterfaces()
+  for (const entries of Object.values(netMap || {})) {
+    if (!Array.isArray(entries)) continue
+    for (const entry of entries) {
+      const family = String(entry?.family || '')
+      if (!(family === 'IPv4' || family === '4')) continue
+      if (entry?.internal) continue
+      const ipInt = parseIpv4ToInt(entry?.address)
+      const maskInt = parseIpv4ToInt(entry?.netmask)
+      if (ipInt == null || maskInt == null) continue
+      const broadcast = (ipInt | ((~maskInt) >>> 0)) >>> 0
+      targets.add(formatIpv4FromInt(broadcast))
+    }
+  }
+  return [...targets]
+}
+
 export function createLanRuntime({
   configDir,
   appVersion,
@@ -235,10 +267,13 @@ export function createLanRuntime({
     if (!runtime.enabled || !runtime.udpSocket) return
     const payloadText = JSON.stringify(buildHelloPayload())
     const buffer = Buffer.from(payloadText, 'utf8')
-    try {
-      runtime.udpSocket.send(buffer, runtime.discoveryPort, '255.255.255.255')
-    } catch (error) {
-      emitError(error)
+    const targets = buildBroadcastTargets()
+    for (const host of targets) {
+      try {
+        runtime.udpSocket.send(buffer, runtime.discoveryPort, host)
+      } catch (error) {
+        emitError(error)
+      }
     }
   }
 

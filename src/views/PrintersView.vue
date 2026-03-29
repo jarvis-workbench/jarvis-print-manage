@@ -29,6 +29,15 @@ const openingBackupDir = ref(false)
 const openingBackupDirPrinterKey = ref('')
 const error = ref('')
 const message = ref('')
+const firstScreenLoading = ref(true)
+const firstSnapshotReady = ref(false)
+const firstRuntimeReady = ref(false)
+const firstLoadStartedAt = ref(Date.now())
+let firstLoadForceDoneTimer = null
+let firstLoadMinDelayTimer = null
+
+const FIRST_LOAD_MIN_MS = 450
+const FIRST_LOAD_FORCE_DONE_MS = 15_000
 
 const runtimeStore = useRuntimeStore()
 const { settings, PrinterServerManage } = storeToRefs(runtimeStore)
@@ -59,6 +68,45 @@ const installWizardPrimaryText = computed(() => {
   if (installWizardNeedsIpStep.value && installWizardStep.value === 0) return '下一步'
   return '开始安装'
 })
+
+function clearFirstLoadTimers() {
+  if (firstLoadForceDoneTimer) {
+    clearTimeout(firstLoadForceDoneTimer)
+    firstLoadForceDoneTimer = null
+  }
+  if (firstLoadMinDelayTimer) {
+    clearTimeout(firstLoadMinDelayTimer)
+    firstLoadMinDelayTimer = null
+  }
+}
+
+function tryFinishFirstScreenLoading(force = false) {
+  if (!firstScreenLoading.value) return
+  if (!force && (!firstSnapshotReady.value || !firstRuntimeReady.value)) return
+  const elapsed = Date.now() - Number(firstLoadStartedAt.value || Date.now())
+  const remain = FIRST_LOAD_MIN_MS - elapsed
+  if (remain > 0) {
+    if (firstLoadMinDelayTimer) clearTimeout(firstLoadMinDelayTimer)
+    firstLoadMinDelayTimer = setTimeout(() => {
+      firstScreenLoading.value = false
+      clearFirstLoadTimers()
+    }, remain)
+    return
+  }
+  firstScreenLoading.value = false
+  clearFirstLoadTimers()
+}
+
+function isRuntimeStateReadyPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false
+  const seq = Number(payload?.seq || 0)
+  if (Number.isFinite(seq) && seq > 0) return true
+  const changedAt = String(payload?.changedAt || '').trim()
+  if (changedAt) return true
+  const spooler = String(payload?.spooler || '').trim().toLowerCase()
+  if (spooler && spooler !== 'unknown') return true
+  return false
+}
 
 function clearInstallWizardIpHint() {
   installWizardIpStatus.value = ''
@@ -640,6 +688,10 @@ function applyPrinterSnapshot(payload) {
   })
   refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
   reconcileWaitingUsbReconnectState(runtimeStore.PrinterServerManage?.printers)
+  if (!firstSnapshotReady.value) {
+    firstSnapshotReady.value = true
+    tryFinishFirstScreenLoading()
+  }
 }
 
 async function fetchLegacySnapshotPayload() {
@@ -692,6 +744,10 @@ async function loadPrinters(options = {}) {
       error.value = err instanceof Error ? err.message : String(err)
     }
   } finally {
+    if (!firstSnapshotReady.value && !silent) {
+      firstSnapshotReady.value = true
+      tryFinishFirstScreenLoading()
+    }
     if (seq !== loadPrintersSeq) return
     if (!silent && loadingOwnerSeq === seq) {
       loading.value = false
@@ -701,7 +757,12 @@ async function loadPrinters(options = {}) {
 }
 
 async function handlePrinterStateUpdated(payload) {
-  if (!payload || savingAction.value) return
+  if (!payload) return
+  if (!firstRuntimeReady.value && isRuntimeStateReadyPayload(payload)) {
+    firstRuntimeReady.value = true
+    tryFinishFirstScreenLoading()
+  }
+  if (savingAction.value) return
   runtimeStore.setPrinterRuntimeState(payload)
   refreshInstallSuppressionFromRows(runtimeStore.PrinterServerManage?.printers)
 }
@@ -1019,21 +1080,35 @@ async function openSystemDriverInstall() {
   }
 }
 
-onMounted(async () => {
+onMounted(() => {
+  firstLoadStartedAt.value = Date.now()
+  firstScreenLoading.value = true
+  firstSnapshotReady.value = false
+  firstRuntimeReady.value = false
+  clearFirstLoadTimers()
+  firstLoadForceDoneTimer = setTimeout(() => {
+    tryFinishFirstScreenLoading(true)
+  }, FIRST_LOAD_FORCE_DONE_MS)
+
   subscribePrinterRuntimeState()
   subscribePrinterSnapshot()
+
   if (window.eleDrive?.getPrinterRuntimeState) {
-    try {
-      const state = await window.eleDrive.getPrinterRuntimeState()
-      await handlePrinterStateUpdated(state)
-    } catch {
-      // ignore bootstrap state errors
-    }
+    void window.eleDrive.getPrinterRuntimeState()
+      .then((state) => handlePrinterStateUpdated(state))
+      .catch(() => {
+        // ignore bootstrap state errors
+      })
+  } else {
+    firstRuntimeReady.value = true
+    tryFinishFirstScreenLoading()
   }
-  await loadPrinters({ silent: false })
+
+  void loadPrinters({ silent: false })
 })
 
 onUnmounted(() => {
+  clearFirstLoadTimers()
   unsubscribePrinterSnapshot()
   unsubscribePrinterRuntimeState()
 })
@@ -1064,14 +1139,20 @@ onUnmounted(() => {
     <el-alert v-if="message" :title="message" type="success" show-icon :closable="false" class="status-alert" />
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="status-alert" />
 
-    <el-tabs v-model="activePrinterTab" class="printer-tabs" type="card">
+    <div
+      class="printer-first-load-wrap"
+      v-loading="firstScreenLoading"
+      element-loading-text="正在加载打印机列表..."
+      element-loading-background="rgba(255, 255, 255, 0.76)"
+    >
+      <el-tabs v-model="activePrinterTab" class="printer-tabs" type="card">
       <el-tab-pane label="已安装" name="installed">
         <el-table
           :data="installedRows"
-          v-loading="loading && installedRows.length === 0"
+          v-loading="loading && !firstScreenLoading"
           row-key="printerName"
           class="printer-table"
-          empty-text="未读取到已安装打印机"
+          :empty-text="firstScreenLoading ? '' : '未读取到已安装打印机'"
           table-layout="fixed"
           :fit="true"
         >
@@ -1173,10 +1254,10 @@ onUnmounted(() => {
       <el-tab-pane label="本地驱动" name="local-driver">
         <el-table
           :data="localDriverRows"
-          v-loading="loading && localDriverRows.length === 0"
+          v-loading="loading && !firstScreenLoading"
           row-key="printerName"
           class="printer-table"
-          empty-text="暂无本地驱动"
+          :empty-text="firstScreenLoading ? '' : '暂无本地驱动'"
           table-layout="fixed"
           :fit="true"
         >
@@ -1267,7 +1348,8 @@ onUnmounted(() => {
       <el-tab-pane label="网络驱动" name="network-driver">
         <el-empty description="网络驱动数据待接入" />
       </el-tab-pane>
-    </el-tabs>
+      </el-tabs>
+    </div>
 
     <teleport to="body">
       <transition name="wizard-fade">
