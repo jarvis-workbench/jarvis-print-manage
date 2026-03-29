@@ -41,7 +41,7 @@ onUnmounted(() => {
         <el-menu-item index="/">
           <div class="nav-item-content">
             <span class="menu-icon"><home theme="outline" size="16" /></span>
-            <span class="menu-label">概览</span>
+            <span class="menu-label">首页</span>
           </div>
         </el-menu-item>
         <el-menu-item index="/printers">

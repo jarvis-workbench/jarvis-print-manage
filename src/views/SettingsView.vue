@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { FolderOpen } from '@icon-park/vue-next'
 import { ElMessage } from 'element-plus'
@@ -9,12 +9,17 @@ const loading = ref(false)
 const saving = ref(false)
 const lanSaving = ref(false)
 const lanLoading = ref(false)
+const virtualSaving = ref(false)
 const backupDir = ref('')
 const themeMode = ref('system')
 const lanEnabled = ref(false)
 const lanState = ref(null)
 const lanNodes = ref([])
 const activeSettingsTab = ref('general')
+const keywordsInput = ref('')
+const exactPortsInput = ref('')
+const prefixPortsInput = ref('')
+const containsPortsInput = ref('')
 const error = ref('')
 const runtimeStore = useRuntimeStore()
 let removeLanStateUpdatedListener = null
@@ -28,6 +33,19 @@ const protocolVersionLabel = computed(() => {
   if (/^\d+\.\d+\.\d+$/.test(normalized)) return `V${normalized}`
   return `V${normalized}`
 })
+
+function parseTokenInput(value) {
+  const text = String(value || '')
+  const tokens = text
+    .split(/[\n,;，；]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return [...new Set(tokens)]
+}
+
+function formatTokenInput(list) {
+  return (Array.isArray(list) ? list : []).map((item) => String(item || '').trim()).filter(Boolean).join('\n')
+}
 
 async function loadSettings() {
   if (!window.eleDrive?.getSettings) return
@@ -45,6 +63,19 @@ async function loadSettings() {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadVirtualPrinterConfig() {
+  if (!window.eleDrive?.getVirtualPrinterConfig) return
+  try {
+    const config = await window.eleDrive.getVirtualPrinterConfig()
+    keywordsInput.value = formatTokenInput(config?.keywords)
+    exactPortsInput.value = formatTokenInput(config?.exactPorts)
+    prefixPortsInput.value = formatTokenInput(config?.prefixPorts)
+    containsPortsInput.value = formatTokenInput(config?.containsPorts)
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
   }
 }
 
@@ -135,10 +166,37 @@ async function chooseBackupDirByInput() {
   }
 }
 
+async function saveVirtualPrinterConfig() {
+  if (!window.eleDrive?.setVirtualPrinterConfig) return
+  virtualSaving.value = true
+  error.value = ''
+  try {
+    const saved = await window.eleDrive.setVirtualPrinterConfig({
+      keywords: parseTokenInput(keywordsInput.value),
+      exactPorts: parseTokenInput(exactPortsInput.value),
+      prefixPorts: parseTokenInput(prefixPortsInput.value),
+      containsPorts: parseTokenInput(containsPortsInput.value),
+    })
+    keywordsInput.value = formatTokenInput(saved?.keywords)
+    exactPortsInput.value = formatTokenInput(saved?.exactPorts)
+    prefixPortsInput.value = formatTokenInput(saved?.prefixPorts)
+    containsPortsInput.value = formatTokenInput(saved?.containsPorts)
+    ElMessage.success('虚拟打印机屏蔽配置已保存')
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+    ElMessage.error('虚拟打印机屏蔽配置保存失败')
+  } finally {
+    virtualSaving.value = false
+  }
+}
+
 onMounted(async () => {
   subscribeLanState()
   await loadSettings()
-  await loadLanState()
+  await Promise.all([
+    loadLanState(),
+    loadVirtualPrinterConfig(),
+  ])
 })
 
 onUnmounted(() => {
@@ -170,7 +228,11 @@ onUnmounted(() => {
               <el-option label="跟随系统" value="system" />
             </el-select>
           </el-form-item>
+        </el-form>
+      </el-tab-pane>
 
+      <el-tab-pane label="打印机" name="printer">
+        <el-form label-position="top" class="settings-form">
           <el-form-item label="打印机驱动备份目录">
             <el-input
               v-model="backupDir"
@@ -183,6 +245,52 @@ onUnmounted(() => {
                 <folder-open theme="outline" size="15" />
               </template>
             </el-input>
+          </el-form-item>
+
+          <el-form-item label="虚拟打印机关键字（名称/驱动，换行或逗号分隔）">
+            <el-input
+              v-model="keywordsInput"
+              type="textarea"
+              :rows="4"
+              :disabled="virtualSaving"
+              placeholder="例如：pdf、xps、onenote"
+            />
+          </el-form-item>
+
+          <el-form-item label="虚拟打印机端口-精确匹配（换行或逗号分隔）">
+            <el-input
+              v-model="exactPortsInput"
+              type="textarea"
+              :rows="3"
+              :disabled="virtualSaving"
+              placeholder="例如：FILE:、PORTPROMPT:、NUL:"
+            />
+          </el-form-item>
+
+          <el-form-item label="虚拟打印机端口-前缀匹配（换行或逗号分隔）">
+            <el-input
+              v-model="prefixPortsInput"
+              type="textarea"
+              :rows="3"
+              :disabled="virtualSaving"
+              placeholder="例如：redir、ts"
+            />
+          </el-form-item>
+
+          <el-form-item label="虚拟打印机端口-包含匹配（换行或逗号分隔）">
+            <el-input
+              v-model="containsPortsInput"
+              type="textarea"
+              :rows="3"
+              :disabled="virtualSaving"
+              placeholder="例如：prompt"
+            />
+          </el-form-item>
+
+          <el-form-item>
+            <el-button type="primary" :loading="virtualSaving" @click="saveVirtualPrinterConfig">
+              保存虚拟打印机屏蔽配置
+            </el-button>
           </el-form-item>
         </el-form>
       </el-tab-pane>

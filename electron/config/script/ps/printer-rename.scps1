@@ -1,0 +1,69 @@
+﻿$ErrorActionPreference = 'Stop'
+$printerName = {{PRINTER_NAME}}
+$newPrinterName = {{NEW_PRINTER_NAME}}
+
+if (-not $printerName) {
+  throw 'Printer name is required.'
+}
+if (-not $newPrinterName) {
+  throw 'New printer name is required.'
+}
+if ($printerName -eq $newPrinterName) {
+  [PSCustomObject]@{
+    status = 'unchanged'
+    printerName = $printerName
+    newPrinterName = $newPrinterName
+  } | ConvertTo-Json -Compress
+  return
+}
+
+$source = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
+if (-not $source) {
+  throw "Printer not found: $printerName"
+}
+$target = Get-Printer -Name $newPrinterName -ErrorAction SilentlyContinue
+if ($target) {
+  throw "Printer name already exists: $newPrinterName"
+}
+
+$renamed = $false
+$renameError = $null
+
+if (Get-Command -Name Rename-Printer -ErrorAction SilentlyContinue) {
+  try {
+    Rename-Printer -Name $printerName -NewName $newPrinterName -ErrorAction Stop
+    $renamed = $true
+  } catch {
+    $renameError = $_.Exception.Message
+  }
+}
+
+if (-not $renamed) {
+  try {
+    $escapedOld = $printerName.Replace("'", "''")
+    $wmiPrinter = Get-WmiObject -Class Win32_Printer -Filter "Name='$escapedOld'" -ErrorAction Stop
+    if (-not $wmiPrinter) {
+      throw "WMI printer not found: $printerName"
+    }
+    $wmiResult = $wmiPrinter.RenamePrinter($newPrinterName)
+    $returnValue = if ($wmiResult -is [int]) { $wmiResult } else { [int]($wmiResult.ReturnValue) }
+    if ($returnValue -ne 0) {
+      throw "WMI RenamePrinter returned: $returnValue"
+    }
+    $renamed = $true
+  } catch {
+    if (-not $renameError) {
+      $renameError = $_.Exception.Message
+    }
+  }
+}
+
+if (-not $renamed) {
+  throw "Rename printer failed: $renameError"
+}
+
+[PSCustomObject]@{
+  status = 'renamed'
+  printerName = $printerName
+  newPrinterName = $newPrinterName
+} | ConvertTo-Json -Compress

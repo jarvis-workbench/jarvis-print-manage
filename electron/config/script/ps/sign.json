@@ -53,6 +53,11 @@
       "hash": "bcaa42049e99e834c93ff29bf9742ef3101a578d81774bcdd08b5a48f086fa73",
       "appHash": "ef694b69ea0df269f41db6e73adb42c51d85ed06f438513c17fc182856d3e5a1"
     },
+    "printer-rename": {
+      "file": "printer-rename.scps1",
+      "hash": "b48435225b934e3a8c68bd06e4723194de0a2338d1a3c0b15cf8b526a826aef0",
+      "appHash": "b0e2eefc068283b20a6228c6d7f332ab24bc4bf2b4d4f246a308fc9f1f434f6d"
+    },
     "printer-print-test-page": {
       "file": "printer-print-test-page.scps1",
       "hash": "61c2b3934d4ddf5242146fdb0de93e2ae849802ccffea0b91b7b9f5e35d59fc6",

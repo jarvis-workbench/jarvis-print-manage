@@ -10,10 +10,32 @@ const ERROR_REPORT_INTERVAL_MS = 10_000
 const TIMEOUT_BACKOFF_BASE_MS = 5_000
 const TIMEOUT_BACKOFF_MAX_MS = 60_000
 const DRIVER_INDEX_FILE_NAME = 'driver-index.json'
+const DEFAULT_VIRTUAL_PRINTER_CONFIG = {
+  keywords: [
+    'pdf',
+    'xps',
+    'fax',
+    'onenote',
+    'virtual',
+    'document writer',
+    'microsoft print to pdf',
+    'microsoft xps document writer',
+    'adobe pdf',
+    'foxit pdf',
+    'wps pdf',
+    'doro pdf',
+    'cutepdf',
+    'priprinter',
+  ],
+  exactPorts: ['file:', 'portprompt:', 'nul:'],
+  prefixPorts: ['redir', 'ts'],
+  containsPorts: ['prompt'],
+}
 
 let timer = null
 let seq = 0
 let currentBackupDir = String(workerData?.backupDir || '').trim()
+let currentVirtualPrinterConfig = normalizeVirtualPrinterConfig(workerData?.virtualPrinterConfig || DEFAULT_VIRTUAL_PRINTER_CONFIG)
 let lastSignature = ''
 let lastState = {
   printers: [],
@@ -53,6 +75,39 @@ function normalizeStringList(value) {
   const text = String(value || '').trim()
   if (!text) return []
   return [...new Set(text.split(/[;,]/).map((item) => item.trim()).filter(Boolean))]
+}
+
+function normalizeVirtualPrinterConfig(raw = {}) {
+  const toLowerList = (value) => {
+    const list = Array.isArray(value) ? value : []
+    return [...new Set(list.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean))]
+  }
+
+  return {
+    keywords: toLowerList(raw?.keywords || DEFAULT_VIRTUAL_PRINTER_CONFIG.keywords),
+    exactPorts: toLowerList(raw?.exactPorts || raw?.ports?.exact || DEFAULT_VIRTUAL_PRINTER_CONFIG.exactPorts),
+    prefixPorts: toLowerList(raw?.prefixPorts || raw?.ports?.prefix || DEFAULT_VIRTUAL_PRINTER_CONFIG.prefixPorts),
+    containsPorts: toLowerList(raw?.containsPorts || raw?.ports?.contains || DEFAULT_VIRTUAL_PRINTER_CONFIG.containsPorts),
+  }
+}
+
+function isVirtualPrinter(item = {}, virtualConfig = currentVirtualPrinterConfig) {
+  const printerName = String(item?.printerName || item?.name || '').toLowerCase()
+  const driverName = String(item?.driverName || '').toLowerCase()
+  const portName = String(item?.portName || '').toLowerCase()
+  if (virtualConfig.keywords.some((keyword) => printerName.includes(keyword) || driverName.includes(keyword))) {
+    return true
+  }
+  if (virtualConfig.exactPorts.includes(portName)) {
+    return true
+  }
+  if (virtualConfig.prefixPorts.some((prefix) => portName.startsWith(prefix))) {
+    return true
+  }
+  if (virtualConfig.containsPorts.some((keyword) => portName.includes(keyword))) {
+    return true
+  }
+  return false
 }
 
 function pick(obj, keys, fallback = undefined) {
@@ -228,6 +283,7 @@ function buildManagePrinters(runtimeState, indexEntries) {
   for (const runtimeItem of runtimePrinters) {
     const printerName = normalizeName(runtimeItem?.name)
     if (!printerName) continue
+    if (isVirtualPrinter(runtimeItem, currentVirtualPrinterConfig)) continue
     const runtimePortName = String(runtimeItem?.portName || '')
     const portRecord = portMap.get(normalizeToken(runtimePortName))
     const runtimePortHost = String(portRecord?.printerHostAddress || '')
@@ -261,6 +317,7 @@ function buildManagePrinters(runtimeState, indexEntries) {
   for (const entry of backupEntries) {
     const backupPrinterName = normalizeName(entry?.printerName)
     if (!backupPrinterName) continue
+    if (isVirtualPrinter(entry, currentVirtualPrinterConfig)) continue
     const key = normalizeToken(backupPrinterName)
     const existing = rowMap.get(key)
     if (existing) {
@@ -511,6 +568,9 @@ parentPort?.on('message', (message) => {
   }
   if (type === 'config') {
     currentBackupDir = String(message?.payload?.backupDir || '').trim()
+    currentVirtualPrinterConfig = normalizeVirtualPrinterConfig(
+      message?.payload?.virtualPrinterConfig || currentVirtualPrinterConfig,
+    )
     void pollOnce(true)
     return
   }

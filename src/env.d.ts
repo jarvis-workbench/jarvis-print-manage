@@ -110,6 +110,13 @@ interface PrintJob {
   updatedAt: string
 }
 
+interface VirtualPrinterConfig {
+  keywords: string[]
+  exactPorts: string[]
+  prefixPorts: string[]
+  containsPorts: string[]
+}
+
 interface InstalledPrinter {
   name: string
   driverName: string
@@ -210,6 +217,8 @@ interface Window {
   eleDrive?: {
     getAppVersion: () => Promise<string>
     getSettings: () => Promise<EleDriveSettings>
+    getVirtualPrinterConfig: () => Promise<VirtualPrinterConfig>
+    setVirtualPrinterConfig: (payload: Partial<VirtualPrinterConfig>) => Promise<VirtualPrinterConfig>
     setBackupDir: (backupDir: string) => Promise<EleDriveSettings>
     setThemeMode: (themeMode: ThemeMode) => Promise<EleDriveSettings>
     chooseBackupDir: () => Promise<string | null>
@@ -281,6 +290,11 @@ interface Window {
       status: string
       printerName: string
       dialog?: string
+    }>
+    renamePrinter: (payload: { printerName: string, newPrinterName: string }) => Promise<{
+      status: string
+      printerName: string
+      newPrinterName: string
     }>
     backupPrinterDriver: (payload: {
       printerName: string

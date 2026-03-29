@@ -110,6 +110,7 @@ let printerSnapshotRefreshPending = false
 let lanRuntime = null
 let printSocketService = null
 let printerStateWorkerStarting = false
+let virtualPrinterConfigCache = normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
 
 function isBrokenPipeError(error) {
   if (!error) return false
@@ -195,8 +196,9 @@ function broadcastPrinterSnapshot() {
 }
 
 function broadcastLanState(payload = null) {
-  const state = payload || (lanRuntime ? lanRuntime.getState() : null)
-  if (!state) return
+  const sourceState = payload || (lanRuntime ? lanRuntime.getState() : null)
+  if (!sourceState) return
+  const state = filterVirtualOffersFromLanState(sourceState, virtualPrinterConfigCache)
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win || win.isDestroyed()) continue
     win.webContents.send('lan:state-updated', state)
@@ -229,11 +231,15 @@ function requestPrinterStateRefresh() {
 
 function updatePrinterStateWorkerConfig(payload = {}) {
   if (!printerStateWorker) return
+  const virtualPrinterConfig = normalizeVirtualPrinterConfig(
+    payload?.virtualPrinterConfig || virtualPrinterConfigCache,
+  )
   try {
     printerStateWorker.postMessage({
       type: 'config',
       payload: {
         backupDir: String(payload?.backupDir || '').trim(),
+        virtualPrinterConfig,
       },
     })
   } catch {}
@@ -255,13 +261,17 @@ function stopPrinterStateWorker() {
   printerStateWorker = null
 }
 
-function createPrinterStateWorker({ backupDir = '' } = {}) {
+function createPrinterStateWorker({
+  backupDir = '',
+  virtualPrinterConfig = virtualPrinterConfigCache,
+} = {}) {
   if (printerStateWorker || appIsQuitting) return
   const workerPath = path.join(__dirname, 'worker', 'printer-state.mjs')
   printerStateWorker = new Worker(workerPath, {
     workerData: {
       pollIntervalMs: PRINTER_STATE_POLL_INTERVAL_MS,
       backupDir: String(backupDir || '').trim(),
+      virtualPrinterConfig: normalizeVirtualPrinterConfig(virtualPrinterConfig),
     },
   })
 
@@ -303,13 +313,19 @@ function createPrinterStateWorker({ backupDir = '' } = {}) {
     printerStateWorker = null
     if (!appIsQuitting && code !== 0) {
       setTimeout(() => {
-        createPrinterStateWorker({ backupDir: printerSnapshotState.backupDir })
+        createPrinterStateWorker({
+          backupDir: printerSnapshotState.backupDir,
+          virtualPrinterConfig: virtualPrinterConfigCache,
+        })
       }, 1200)
     }
   })
 }
 
-function startPrinterStateWorker({ backupDir = '' } = {}) {
+function startPrinterStateWorker({
+  backupDir = '',
+  virtualPrinterConfig = virtualPrinterConfigCache,
+} = {}) {
   if (printerStateWorker || printerStateWorkerStarting || appIsQuitting) return
   printerStateWorkerStarting = true
   setTimeout(() => {
@@ -318,7 +334,7 @@ function startPrinterStateWorker({ backupDir = '' } = {}) {
       return
     }
     try {
-      createPrinterStateWorker({ backupDir })
+      createPrinterStateWorker({ backupDir, virtualPrinterConfig })
     } catch (error) {
       printerStateWorkerStarting = false
       logWarn(`[printer-state] start failed: ${error?.message || error}`)
@@ -533,6 +549,29 @@ async function openPrinterPreferencesDialog({ printerName }) {
   return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
 }
 
+async function renameInstalledPrinter({ printerName, newPrinterName }) {
+  const sourcePrinterName = String(printerName || '').trim()
+  const targetPrinterName = String(newPrinterName || '').trim()
+  if (!sourcePrinterName) {
+    throw new Error('Printer name is required.')
+  }
+  if (!targetPrinterName) {
+    throw new Error('New printer name is required.')
+  }
+  if (sourcePrinterName === targetPrinterName) {
+    return {
+      status: 'unchanged',
+      printerName: sourcePrinterName,
+      newPrinterName: targetPrinterName,
+    }
+  }
+  const script = await loadPsScript('printer-rename', {
+    PRINTER_NAME: toPsSingleQuote(sourcePrinterName),
+    NEW_PRINTER_NAME: toPsSingleQuote(targetPrinterName),
+  })
+  return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
+}
+
 function getDefaultBackupDir() {
   const docsPath = sanitizeBackupDirPath(app.getPath('documents'))
   if (docsPath) {
@@ -679,8 +718,23 @@ async function readVirtualPrinterConfig() {
   }
 }
 
+async function writeVirtualPrinterConfig(raw = {}) {
+  const normalized = normalizeVirtualPrinterConfig(raw)
+  const filePath = getVirtualPrinterConfigPath()
+  await fs.mkdir(path.dirname(filePath), { recursive: true })
+  await fs.writeFile(filePath, JSON.stringify(normalized, null, 2), 'utf-8')
+  virtualPrinterConfigCache = normalized
+  return normalized
+}
+
+function updateVirtualPrinterConfigCache(nextConfig = null) {
+  const normalized = normalizeVirtualPrinterConfig(nextConfig || DEFAULT_VIRTUAL_PRINTER_CONFIG)
+  virtualPrinterConfigCache = normalized
+  return normalized
+}
+
 function isVirtualPrinter(printer, virtualConfig = DEFAULT_VIRTUAL_PRINTER_CONFIG) {
-  const name = String(printer?.name || '').toLowerCase()
+  const name = String(printer?.name || printer?.printerName || '').toLowerCase()
   const driverName = String(printer?.driverName || '').toLowerCase()
   const portName = String(printer?.portName || '').toLowerCase()
 
@@ -701,6 +755,19 @@ function isVirtualPrinter(printer, virtualConfig = DEFAULT_VIRTUAL_PRINTER_CONFI
   }
 
   return false
+}
+
+function filterVirtualPrinterRows(rows = [], virtualConfig = virtualPrinterConfigCache) {
+  const list = Array.isArray(rows) ? rows : []
+  return list.filter((item) => !isVirtualPrinter(item, virtualConfig))
+}
+
+function filterVirtualOffersFromLanState(state = {}, virtualConfig = virtualPrinterConfigCache) {
+  const offers = filterVirtualPrinterRows(state?.offers, virtualConfig)
+  return {
+    ...(state || {}),
+    offers,
+  }
 }
 
 function normalizeStringArray(value) {
@@ -1157,6 +1224,7 @@ async function listLanTransferOffers({ nodeId = '' } = {}) {
   const indexObj = await ensureBackupIndex(backupDir)
   const offers = []
   for (const entry of indexObj.entries || []) {
+    if (isVirtualPrinter(entry, virtualPrinterConfigCache)) continue
     const offer = toLanOfferRecord({ entry, backupDir, nodeId })
     if (!offer?.archiveRelativePath) continue
     const archiveExists = await isFileExists(offer.archivePath)
@@ -1504,7 +1572,7 @@ async function applyLanSettings(settings = {}) {
   } else {
     await runtime.stop()
   }
-  return runtime.getState()
+  return filterVirtualOffersFromLanState(runtime.getState(), virtualPrinterConfigCache)
 }
 
 function ensurePrintSocketService() {
@@ -1542,9 +1610,8 @@ async function applyPrintServiceSettings(settings = {}) {
 async function getInstalledPrinters() {
   const script = await loadPsScript('printer-list-installed')
   const data = await runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
-  const virtualPrinterConfig = await readVirtualPrinterConfig()
   const list = Array.isArray(data) ? data : data ? [data] : []
-  const filtered = list.filter((item) => !isVirtualPrinter(item, virtualPrinterConfig))
+  const filtered = filterVirtualPrinterRows(list, virtualPrinterConfigCache)
   const normalized = await Promise.all(
     filtered.map(async (item) => ({
       ...item,
@@ -2238,6 +2305,7 @@ if (!gotSingleInstanceLock) {
 
   app.whenReady().then(async () => {
     registerCustomProtocolClient()
+    updateVirtualPrinterConfigCache(await readVirtualPrinterConfig())
     let startupSettings = await readSettings()
     startupSettings = await ensureStartupBackupDirSetting(startupSettings)
     await ensureBackupIndex(startupSettings.backupDir)
@@ -2259,6 +2327,9 @@ if (!gotSingleInstanceLock) {
     upsertIpcHandler('app:get-version', () => app.getVersion())
 
     upsertIpcHandler('settings:get', async () => readSettings())
+    upsertIpcHandler('settings:get-virtual-printer-config', async () => ({
+      ...virtualPrinterConfigCache,
+    }))
     upsertIpcHandler('settings:set-backup-dir', async (_, backupDir) => {
       if (!backupDir || typeof backupDir !== 'string') {
         throw new Error('Invalid backup directory path.')
@@ -2270,6 +2341,19 @@ if (!gotSingleInstanceLock) {
       requestPrinterStateRefresh()
       await refreshPrinterSnapshot({ broadcast: true })
       return saved
+    })
+    upsertIpcHandler('settings:set-virtual-printer-config', async (_, payload) => {
+      const savedConfig = await writeVirtualPrinterConfig(payload || {})
+      updatePrinterStateWorkerConfig({
+        backupDir: printerSnapshotState.backupDir,
+        virtualPrinterConfig: savedConfig,
+      })
+      requestPrinterStateRefresh()
+      await refreshPrinterSnapshot({ broadcast: true })
+      broadcastLanState()
+      return {
+        ...savedConfig,
+      }
     })
     upsertIpcHandler('settings:set-theme-mode', async (_, themeMode) => {
       if (!THEME_MODES.has(themeMode)) {
@@ -2305,7 +2389,7 @@ if (!gotSingleInstanceLock) {
 
     upsertIpcHandler('lan:get-state', async () => {
       const runtime = ensureLanRuntime()
-      return runtime.getState()
+      return filterVirtualOffersFromLanState(runtime.getState(), virtualPrinterConfigCache)
     })
     upsertIpcHandler('lan:set-enabled', async (_, payload) => {
       const enabled = toBool(payload?.enabled, false)
@@ -2325,7 +2409,7 @@ if (!gotSingleInstanceLock) {
       if (typeof runtime.syncOffers === 'function') {
         await runtime.syncOffers()
       }
-      return runtime.listOffers()
+      return filterVirtualPrinterRows(runtime.listOffers(), virtualPrinterConfigCache)
     })
     upsertIpcHandler('lan:request-install', async (_, payload) => {
       const runtime = ensureLanRuntime()
@@ -2410,6 +2494,21 @@ if (!gotSingleInstanceLock) {
         printerName: payload.printerName,
       })
     })
+    upsertIpcHandler('printers:rename', async (_, payload) => {
+      if (!payload?.printerName || typeof payload.printerName !== 'string') {
+        throw new Error('Invalid printer name.')
+      }
+      if (!payload?.newPrinterName || typeof payload.newPrinterName !== 'string') {
+        throw new Error('Invalid new printer name.')
+      }
+      const result = await renameInstalledPrinter({
+        printerName: payload.printerName,
+        newPrinterName: payload.newPrinterName,
+      })
+      requestPrinterStateRefresh()
+      await refreshPrinterSnapshot({ broadcast: true })
+      return result
+    })
     upsertIpcHandler('printers:backup-driver', async (_, payload) => {
       if (!payload?.printerName || typeof payload.printerName !== 'string') {
         throw new Error('Invalid printer name.')
@@ -2492,7 +2591,10 @@ if (!gotSingleInstanceLock) {
 
     createMainWindow()
     createTray()
-    startPrinterStateWorker({ backupDir: startupSettings.backupDir })
+    startPrinterStateWorker({
+      backupDir: startupSettings.backupDir,
+      virtualPrinterConfig: virtualPrinterConfigCache,
+    })
     void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
       logWarn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
     })

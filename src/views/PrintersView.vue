@@ -12,6 +12,7 @@ const printingTestNames = ref(new Set())
 const deletingBackupNames = ref(new Set())
 const openingPropertiesNames = ref(new Set())
 const openingPreferencesNames = ref(new Set())
+const renamingNames = ref(new Set())
 const uninstalling = ref(false)
 const installWizardVisible = ref(false)
 const installWizardSubmitting = ref(false)
@@ -51,6 +52,9 @@ let loadPrintersSeq = 0
 let loadingOwnerSeq = 0
 const installSuppressedUntil = ref(new Map())
 const activePrinterTab = ref('installed')
+const lanTaskStatusMap = ref(new Map())
+const lanTaskTransitionReady = ref(false)
+const pendingLanTaskIds = ref(new Set())
 
 const allRows = computed(() => (Array.isArray(PrinterServerManage.value?.printers) ? PrinterServerManage.value.printers : []))
 const installedRows = computed(() => allRows.value.filter((item) => item?.installed))
@@ -271,6 +275,15 @@ function isRequestingLanInstall(row) {
   return requestingLanInstallKeys.value.has(key)
 }
 
+function markPendingLanTask(taskId, pending) {
+  const key = String(taskId || '').trim()
+  if (!key) return
+  const next = new Set(pendingLanTaskIds.value)
+  if (pending) next.add(key)
+  else next.delete(key)
+  pendingLanTaskIds.value = next
+}
+
 function markBackingUp(printerName, loading) {
   const key = normalizePrinterKey(printerName)
   if (!key) return
@@ -339,6 +352,20 @@ function markOpeningPreferences(printerName, loading) {
 function isOpeningPreferences(row) {
   const key = normalizePrinterKey(row?.printerName)
   return key ? openingPreferencesNames.value.has(key) : false
+}
+
+function markRenaming(printerName, loading) {
+  const key = normalizePrinterKey(printerName)
+  if (!key) return
+  const next = new Set(renamingNames.value)
+  if (loading) next.add(key)
+  else next.delete(key)
+  renamingNames.value = next
+}
+
+function isRenaming(row) {
+  const key = normalizePrinterKey(row?.printerName)
+  return key ? renamingNames.value.has(key) : false
 }
 
 function parseIpCandidate(rawValue) {
@@ -512,6 +539,16 @@ function getOpenInstalledPrinterDialogDisableReason(row) {
   return ''
 }
 
+function getRenameDisableReason(row) {
+  if (isRenaming(row)) return '当前打印机正在重命名'
+  if (installFlowActive.value) return '正在安装，请稍后'
+  if (backupFlowActive.value) return '正在备份，请稍后'
+  if (uninstalling.value) return '正在卸载，请稍后'
+  if (showWaitingUsbHint(row)) return '等待打印机USB重新接入'
+  if (!row?.installed) return '打印机未安装'
+  return ''
+}
+
 function getDeleteBackupDisableReason(row) {
   if (isDeletingBackup(row)) return '正在删除备份'
   if (isBackingUp(row)) return '当前打印机正在备份'
@@ -590,6 +627,15 @@ function getInlineActionItems(row, tabName = activePrinterTab.value) {
       reason: openDialogReason,
       loading: isOpeningPreferences(row),
       loadingLabel: '正在打开',
+    })
+    const renameReason = getRenameDisableReason(row)
+    actions.push({
+      command: 'rename-printer',
+      label: '打印机重命名',
+      disabled: Boolean(renameReason),
+      reason: renameReason,
+      loading: isRenaming(row),
+      loadingLabel: '正在重命名',
     })
     actions.push({
       command: 'uninstall',
@@ -681,6 +727,7 @@ function getActionTriggerState(row, tabName = activePrinterTab.value) {
   }
   const name = String(row?.printerName || '')
   if (isOpeningProperties(row) || isOpeningPreferences(row)) return { busy: true, label: '正在打开' }
+  if (isRenaming(row)) return { busy: true, label: '正在重命名' }
   if (isPrintingTest(row)) return { busy: true, label: '正在发送' }
   if (isBackingUp(row)) return { busy: true, label: '正在备份' }
   if (savingAction.value === `install:${name}`) return { busy: true, label: '正在安装' }
@@ -747,6 +794,57 @@ async function openInstalledPrinterPreferences(row) {
     ElMessage.error(`打开打印机首选项失败：${detail}`)
   } finally {
     markOpeningPreferences(row?.printerName, false)
+  }
+}
+
+async function renameInstalledPrinter(row) {
+  if (!window.eleDrive?.renamePrinter) return
+  const disabledReason = getRenameDisableReason(row)
+  if (disabledReason) {
+    ElMessage.warning(disabledReason)
+    return
+  }
+
+  let nextPrinterName = ''
+  try {
+    const result = await ElMessageBox.prompt('请输入新的打印机名称', '打印机重命名', {
+      inputValue: String(row?.printerName || ''),
+      confirmButtonText: '确认',
+      cancelButtonText: '取消',
+      inputPlaceholder: '新的打印机名称',
+    })
+    nextPrinterName = String(result?.value || '').trim()
+  } catch {
+    return
+  }
+
+  if (!nextPrinterName) {
+    ElMessage.warning('请输入打印机名称')
+    return
+  }
+  if (normalizePrinterKey(nextPrinterName) === normalizePrinterKey(row?.printerName)) {
+    ElMessage.info('名称未发生变化')
+    return
+  }
+  if (isDuplicatePrinterName(nextPrinterName)) {
+    ElMessage.warning('打印机显示名称已存在，请更换名称')
+    return
+  }
+
+  markRenaming(row?.printerName, true)
+  error.value = ''
+  try {
+    await window.eleDrive.renamePrinter({
+      printerName: row.printerName,
+      newPrinterName: nextPrinterName,
+    })
+    ElMessage.success('打印机重命名成功')
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    error.value = detail
+    ElMessage.error(`打印机重命名失败：${detail}`)
+  } finally {
+    markRenaming(row?.printerName, false)
   }
 }
 
@@ -842,6 +940,7 @@ async function requestLanInstall(row) {
     if (!response?.taskId) {
       throw new Error('安装任务创建失败：未返回任务ID')
     }
+    markPendingLanTask(response.taskId, true)
     ElMessage.success('已创建网络安装任务')
     await refreshLanState({ silent: true })
   } catch (err) {
@@ -850,6 +949,53 @@ async function requestLanInstall(row) {
     ElMessage.error(`创建安装任务失败：${detail}`)
   } finally {
     markRequestingLanInstall(row, false)
+  }
+}
+
+function resolveLanTaskPrinterName(task) {
+  const nodeId = String(task?.nodeId || '').trim()
+  const offerId = String(task?.offerId || '').trim()
+  if (!nodeId || !offerId) return ''
+  const offer = (Array.isArray(lanOffers.value) ? lanOffers.value : []).find(
+    (item) => String(item?.nodeId || '').trim() === nodeId && String(item?.offerId || '').trim() === offerId,
+  )
+  return String(offer?.printerName || '').trim()
+}
+
+function syncLanTaskTransitions(tasks) {
+  const list = Array.isArray(tasks) ? tasks : []
+  const nextMap = new Map()
+  for (const item of list) {
+    const taskId = String(item?.taskId || '').trim()
+    if (!taskId) continue
+    const status = String(item?.status || '').trim().toUpperCase()
+    const previousStatus = String(lanTaskStatusMap.value.get(taskId) || '').toUpperCase()
+    const taskType = String(item?.type || '').trim().toLowerCase()
+    const isPendingTask = pendingLanTaskIds.value.has(taskId)
+
+    if (
+      lanTaskTransitionReady.value
+      && isPendingTask
+      && taskType === 'install'
+      && status === 'DONE'
+      && previousStatus !== 'DONE'
+    ) {
+      const printerName = resolveLanTaskPrinterName(item)
+      if (printerName) {
+        ElMessage.success(`网络驱动安装成功：${printerName}`)
+      } else {
+        ElMessage.success('网络驱动安装成功')
+      }
+    }
+    if (isPendingTask && ['DONE', 'FAILED', 'CANCELED'].includes(status)) {
+      markPendingLanTask(taskId, false)
+    }
+
+    nextMap.set(taskId, status)
+  }
+  lanTaskStatusMap.value = nextMap
+  if (!lanTaskTransitionReady.value) {
+    lanTaskTransitionReady.value = true
   }
 }
 
@@ -870,6 +1016,10 @@ function handleInlineAction(command, row, tabName = activePrinterTab.value) {
   }
   if (cmd === 'open-printer-preferences') {
     void openInstalledPrinterPreferences(row)
+    return
+  }
+  if (cmd === 'rename-printer') {
+    void renameInstalledPrinter(row)
     return
   }
   if (cmd === 'backup') {
@@ -1406,7 +1556,14 @@ onUnmounted(() => {
   unsubscribeLanState()
   unsubscribePrinterSnapshot()
   unsubscribePrinterRuntimeState()
+  lanTaskStatusMap.value = new Map()
+  pendingLanTaskIds.value = new Set()
+  lanTaskTransitionReady.value = false
 })
+
+watch(lanTasks, (tasks) => {
+  syncLanTaskTransitions(tasks)
+}, { deep: true, immediate: true })
 
 watch(activePrinterTab, (tab) => {
   if (String(tab || '') !== 'network-driver') return

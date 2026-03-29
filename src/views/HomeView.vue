@@ -18,7 +18,7 @@ onMounted(async () => {
     <template #header>
       <div class="panel-head">
         <div class="panel-title-wrap">
-          <h1>项目概览</h1>
+          <h1>首页</h1>
           <el-tag type="success" effect="dark">v{{ version }}</el-tag>
         </div>
       </div>
