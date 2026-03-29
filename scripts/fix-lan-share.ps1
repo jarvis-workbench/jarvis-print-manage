@@ -13,6 +13,15 @@ Examples:
 
 3) Mixed auth mode (allow passwordless guest shares + keep password prompt for protected shares):
    PowerShell -ExecutionPolicy Bypass -File .\scripts\fix-lan-share.ps1 -MixedAuth
+
+4) Printer host mode (run on the PC that shares printers):
+   PowerShell -ExecutionPolicy Bypass -File .\scripts\fix-lan-share.ps1 -PrinterHost -FixPrinterLegacy
+
+5) Printer install compatibility (run on client if shared printer add keeps failing):
+   PowerShell -ExecutionPolicy Bypass -File .\scripts\fix-lan-share.ps1 -PrinterInstallCompat
+
+6) Force skip SMB policy changes:
+   PowerShell -ExecutionPolicy Bypass -File .\scripts\fix-lan-share.ps1 -SkipSmbPolicy
 #>
 
 [CmdletBinding()]
@@ -22,7 +31,10 @@ param(
 
     [switch]$EnableSMB1Legacy,
     [switch]$FixPrinterLegacy,
-    [switch]$MixedAuth
+    [switch]$MixedAuth,
+    [switch]$PrinterHost,
+    [switch]$PrinterInstallCompat,
+    [switch]$SkipSmbPolicy
 )
 
 Set-StrictMode -Version 2.0
@@ -257,14 +269,31 @@ function Configure-PrinterPolicy {
     Set-ServiceSafe -Name "Spooler" -StartupType Automatic -StartNow
 
     $pointAndPrintPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
-    if ($Mode -eq "Safe") {
+    $rpcPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC"
+
+    if ($Mode -eq "Safe" -and -not $PrinterInstallCompat) {
         Set-RegistryDword -Path $pointAndPrintPath -Name "RestrictDriverInstallationToAdministrators" -Value 1
     } else {
         Set-RegistryDword -Path $pointAndPrintPath -Name "RestrictDriverInstallationToAdministrators" -Value 0
-        Write-Log "Compatibility mode relaxed Point and Print driver installation restriction." "WARN"
+        Set-RegistryDword -Path $pointAndPrintPath -Name "NoWarningNoElevationOnInstall" -Value 1
+        Set-RegistryDword -Path $pointAndPrintPath -Name "UpdatePromptSettings" -Value 0
+        Write-Log "Compatibility mode relaxed Point and Print installation restrictions." "WARN"
     }
 
-    if ($FixPrinterLegacy) {
+    # Client compatibility: force named-pipe fallback for printer RPC.
+    Set-RegistryDword -Path $rpcPolicyPath -Name "RpcUseNamedPipeProtocol" -Value 1
+
+    if ($PrinterHost) {
+        # Host compatibility: listen on TCP+NamedPipe+other RPC transports.
+        Set-RegistryDword -Path $rpcPolicyPath -Name "RpcProtocols" -Value 7
+        cmd /c "netsh advfirewall firewall delete rule name=`"LAN-PRINT-RPC-TCP-135`"" | Out-Null
+        cmd /c "netsh advfirewall firewall delete rule name=`"LAN-PRINT-RPC-TCP-DYNAMIC`"" | Out-Null
+        cmd /c "netsh advfirewall firewall add rule name=`"LAN-PRINT-RPC-TCP-135`" dir=in action=allow protocol=TCP localport=135 profile=private,domain" | Out-Null
+        cmd /c "netsh advfirewall firewall add rule name=`"LAN-PRINT-RPC-TCP-DYNAMIC`" dir=in action=allow protocol=TCP localport=49152-65535 profile=private,domain" | Out-Null
+        Write-Log "Printer host RPC firewall rules applied (135 + dynamic ports)."
+    }
+
+    if ($FixPrinterLegacy -or $PrinterHost) {
         $printPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Print"
         Set-RegistryDword -Path $printPath -Name "RpcAuthnLevelPrivacyEnabled" -Value 0
         $script:RebootRequired = $true
@@ -285,6 +314,9 @@ function Show-Result {
     Write-Host "  1) Open: \\target-ip\share-name"
     Write-Host "  2) Add printer: \\target-host\printer-share-name"
     Write-Host "  3) If auth behavior is unexpected, clear SMB sessions: net use * /delete /y"
+    if ($PrinterHost) {
+        Write-Host "  4) This run included printer-host RPC compatibility rules."
+    }
     Write-Host "======================================"
 }
 
@@ -299,8 +331,16 @@ try {
     }
 
     Configure-DiscoveryAndSharing
-    Configure-SmbPolicy -OsInfo $osInfo
-    Refresh-SmbClientState
+    $applySmbPolicy = $true
+    if ($PrinterHost -or $SkipSmbPolicy) {
+        $applySmbPolicy = $false
+        Write-Log "Skipping SMB policy changes for this run."
+    }
+
+    if ($applySmbPolicy) {
+        Configure-SmbPolicy -OsInfo $osInfo
+        Refresh-SmbClientState
+    }
     Configure-PrinterPolicy
     Write-Log "All repair steps completed."
     Show-Result
