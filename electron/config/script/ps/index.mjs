@@ -5,19 +5,59 @@ import { fileURLToPath } from 'node:url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const SIGN_FILE = path.join(__dirname, 'sign.json')
 const PLACEHOLDER_PATTERN = /\{\{([A-Z0-9_]+)\}\}/g
 
 const scriptCache = new Map()
+let scriptRootPromise = null
+let signManifestRoot = ''
 let signManifestPromise = null
+
+function uniq(values = []) {
+  return [...new Set(values.filter(Boolean))]
+}
+
+function buildScriptRootCandidates() {
+  const resourcesPath = String(process.resourcesPath || '').trim()
+  const candidates = [
+    __dirname,
+  ]
+
+  if (resourcesPath) {
+    candidates.push(path.join(resourcesPath, 'app.asar', 'electron', 'config', 'script', 'ps'))
+    candidates.push(path.join(resourcesPath, 'app.asar.unpacked', 'electron', 'config', 'script', 'ps'))
+  }
+
+  return uniq(candidates)
+}
+
+async function resolveScriptRoot() {
+  if (!scriptRootPromise) {
+    scriptRootPromise = (async () => {
+      const candidates = buildScriptRootCandidates()
+      for (const root of candidates) {
+        const signFile = path.join(root, 'sign.json')
+        try {
+          const stat = await fs.stat(signFile)
+          if (stat.isFile()) {
+            return root
+          }
+        } catch {}
+      }
+      throw new Error(`PowerShell script root not found. Tried: ${candidates.join(' | ')}`)
+    })()
+  }
+  return scriptRootPromise
+}
 
 function sha256(text) {
   return createHash('sha256').update(String(text), 'utf8').digest('hex')
 }
 
 async function getSignManifest() {
-  if (!signManifestPromise) {
-    signManifestPromise = fs.readFile(SIGN_FILE, 'utf8').then((text) => JSON.parse(text))
+  const root = await resolveScriptRoot()
+  if (!signManifestPromise || signManifestRoot !== root) {
+    signManifestRoot = root
+    signManifestPromise = fs.readFile(path.join(root, 'sign.json'), 'utf8').then((text) => JSON.parse(text))
   }
   return signManifestPromise
 }
@@ -44,14 +84,16 @@ async function readScriptTemplate(name) {
   if (!scriptName) {
     throw new Error('PowerShell script name is required.')
   }
-  if (scriptCache.has(scriptName)) {
-    return scriptCache.get(scriptName)
+  const root = await resolveScriptRoot()
+  const cacheKey = `${root}::${scriptName}`
+  if (scriptCache.has(cacheKey)) {
+    return scriptCache.get(cacheKey)
   }
 
   const fileName = scriptName.endsWith('.scps1') ? scriptName : `${scriptName}.scps1`
-  const absPath = path.join(__dirname, fileName)
+  const absPath = path.join(root, fileName)
   const text = await fs.readFile(absPath, 'utf8')
-  scriptCache.set(scriptName, text)
+  scriptCache.set(cacheKey, text)
   return text
 }
 

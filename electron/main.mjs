@@ -93,6 +93,34 @@ let printerSnapshotRefreshRunning = false
 let printerSnapshotRefreshPending = false
 let lanRuntime = null
 
+function isBrokenPipeError(error) {
+  if (!error) return false
+  if (String(error?.code || '').toUpperCase() === 'EPIPE') return true
+  const message = String(error?.message || '').toLowerCase()
+  return message.includes('broken pipe')
+}
+
+function safeConsole(method, ...args) {
+  try {
+    const fn = console?.[method]
+    if (typeof fn === 'function') {
+      fn(...args)
+    }
+  } catch (error) {
+    if (!isBrokenPipeError(error)) {
+      // Ignore logging failures in packaged apps where stdio may be detached.
+    }
+  }
+}
+
+function logWarn(...args) {
+  safeConsole('warn', ...args)
+}
+
+function logError(...args) {
+  safeConsole('error', ...args)
+}
+
 function upsertIpcHandler(channel, handler) {
   try {
     ipcMain.removeHandler(channel)
@@ -200,12 +228,12 @@ function startPrinterStateWorker() {
     }
     if (type === 'error') {
       const msg = message?.payload?.message || 'unknown error'
-      console.warn(`[printer-state] ${msg}`)
+      logWarn(`[printer-state] ${msg}`)
     }
   })
 
   printerStateWorker.on('error', (error) => {
-    console.warn(`[printer-state] crash: ${error?.message || error}`)
+    logWarn(`[printer-state] crash: ${error?.message || error}`)
   })
 
   printerStateWorker.on('exit', (code) => {
@@ -775,11 +803,11 @@ function ensureLanRuntime() {
       broadcastLanState(state)
     },
     onError: (error) => {
-      console.warn(`[lan-runtime] ${error?.message || error}`)
+      logWarn(`[lan-runtime] ${error?.message || error}`)
     },
   })
   void lanRuntime.bootstrap().catch((error) => {
-    console.warn(`[lan-runtime] bootstrap failed: ${error?.message || error}`)
+    logWarn(`[lan-runtime] bootstrap failed: ${error?.message || error}`)
   })
   return lanRuntime
 }
@@ -842,7 +870,7 @@ async function refreshPrinterSnapshot({ broadcast = true } = {}) {
     if (printerSnapshotRefreshPending) {
       printerSnapshotRefreshPending = false
       void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
-        console.warn(`[printer-snapshot] refresh failed: ${error?.message || error}`)
+        logWarn(`[printer-snapshot] refresh failed: ${error?.message || error}`)
       })
     }
   }
@@ -855,7 +883,7 @@ function schedulePrinterSnapshotRefresh(delayMs = 900) {
   printerSnapshotRefreshTimer = setTimeout(() => {
     printerSnapshotRefreshTimer = null
     void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
-      console.warn(`[printer-snapshot] scheduled refresh failed: ${error?.message || error}`)
+      logWarn(`[printer-snapshot] scheduled refresh failed: ${error?.message || error}`)
     })
   }, Math.max(Number(delayMs) || 0, 0))
 }
@@ -1231,7 +1259,7 @@ function registerCustomProtocolClient() {
     }
     app.setAsDefaultProtocolClient(CUSTOM_PROTOCOL_SCHEME)
   } catch (error) {
-    console.warn(`[protocol] register failed: ${error?.message || error}`)
+    logWarn(`[protocol] register failed: ${error?.message || error}`)
   }
 }
 
@@ -1292,7 +1320,7 @@ function createTray() {
 
   const trayIcon = getTrayIcon()
   if (!trayIcon) {
-    console.warn('[tray] tray icon not found, skip tray initialization.')
+    logWarn('[tray] tray icon not found, skip tray initialization.')
     return null
   }
 
@@ -1370,7 +1398,7 @@ function createMainWindow() {
     win.loadURL(devUrl)
     win.webContents.openDevTools({ mode: 'detach' })
     win.webContents.on('did-fail-load', (_, code, desc, url) => {
-      console.error(`[renderer-load-failed] code=${code} desc=${desc} url=${url}`)
+      logError(`[renderer-load-failed] code=${code} desc=${desc} url=${url}`)
     })
   } else {
     win.loadFile(path.join(packagedAppRoot, 'dist', 'index.html'))
@@ -1422,7 +1450,7 @@ if (!gotSingleInstanceLock) {
     try {
       await applyLanSettings(startupSettings)
     } catch (error) {
-      console.warn(`[lan-runtime] apply startup settings failed: ${error?.message || error}`)
+      logWarn(`[lan-runtime] apply startup settings failed: ${error?.message || error}`)
     }
 
     upsertIpcHandler('app:get-version', () => app.getVersion())
@@ -1620,7 +1648,7 @@ if (!gotSingleInstanceLock) {
     createTray()
     startPrinterStateWorker()
     void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
-      console.warn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
+      logWarn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
     })
     if (pendingProtocolRoutePath) {
       const pendingPath = pendingProtocolRoutePath

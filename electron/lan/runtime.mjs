@@ -54,6 +54,23 @@ function createLanError(code, message) {
   return error
 }
 
+function isBrokenPipeError(error) {
+  if (!error) return false
+  if (String(error?.code || '').toUpperCase() === 'EPIPE') return true
+  const message = String(error?.message || '').toLowerCase()
+  return message.includes('broken pipe')
+}
+
+function safeWarn(...args) {
+  try {
+    console.warn(...args)
+  } catch (error) {
+    if (!isBrokenPipeError(error)) {
+      // Ignore logging failures when stdio is detached.
+    }
+  }
+}
+
 function sortNodes(list = []) {
   return [...list].sort((a, b) => String(a.machineName || '').localeCompare(String(b.machineName || '')))
 }
@@ -103,7 +120,7 @@ export function createLanRuntime({
       return
     }
     // eslint-disable-next-line no-console
-    console.warn(`[lan-runtime] ${error?.message || error}`)
+    safeWarn(`[lan-runtime] ${error?.message || error}`)
   }
 
   async function ensureConfigDir() {
