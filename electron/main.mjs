@@ -1038,6 +1038,7 @@ async function normalizeInstalledDriverVersion(driver) {
   const parsedInf = await readDriverVerFromInfFile(infPath)
   return {
     ...driver,
+    infPath: infPath || String(driver.infPath || ''),
     driverVersion: normalizeDriverVersionDisplay(driver.driverVersion, parsedInf),
   }
 }

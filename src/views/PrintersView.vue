@@ -1645,7 +1645,7 @@ watch(activePrinterTab, (tab) => {
 </script>
 
 <template>
-  <el-card class="panel-card" shadow="never">
+  <el-card class="panel-card printer-panel-card" shadow="never">
     <template #header>
       <div class="panel-head">
         <div class="panel-title-wrap">
@@ -1680,12 +1680,13 @@ watch(activePrinterTab, (tab) => {
       element-loading-background="rgba(255, 255, 255, 0.76)"
     >
       <el-tabs v-model="activePrinterTab" class="printer-tabs" type="card">
-      <el-tab-pane label="已安装" name="installed">
+      <el-tab-pane label="已安装" name="installed" class="printer-tab-pane">
         <el-table
           :data="installedRows"
           v-loading="loading && !firstScreenLoading"
           row-key="printerName"
           class="printer-table"
+          height="100%"
           :empty-text="firstScreenLoading ? '' : '未读取到已安装打印机'"
           table-layout="fixed"
           :fit="true"
@@ -1694,7 +1695,7 @@ watch(activePrinterTab, (tab) => {
             <template #default="{ row }">
               <el-descriptions :column="1" border size="small" class="expand-desc">
                 <el-descriptions-item label="厂商">{{ row.manufacturer || '-' }}</el-descriptions-item>
-                <el-descriptions-item v-if="row.installed" label="索引INF">
+                <el-descriptions-item v-if="row.installed" label="系统INF">
                   <span class="mono">{{ infDisplayText(row) }}</span>
                 </el-descriptions-item>
                 <el-descriptions-item label="驱动状态">
@@ -1785,12 +1786,13 @@ watch(activePrinterTab, (tab) => {
         </el-table>
       </el-tab-pane>
 
-      <el-tab-pane label="本地驱动" name="local-driver">
+      <el-tab-pane label="本地驱动" name="local-driver" class="printer-tab-pane">
         <el-table
           :data="localDriverRows"
           v-loading="loading && !firstScreenLoading"
           row-key="printerName"
           class="printer-table"
+          height="100%"
           :empty-text="firstScreenLoading ? '' : '暂无本地驱动'"
           table-layout="fixed"
           :fit="true"
@@ -1879,12 +1881,13 @@ watch(activePrinterTab, (tab) => {
         </el-table>
       </el-tab-pane>
 
-      <el-tab-pane label="网络驱动" name="network-driver">
+      <el-tab-pane label="网络驱动" name="network-driver" class="printer-tab-pane">
         <el-table
           :data="networkDriverRows"
           v-loading="lanLoading"
           row-key="key"
           class="printer-table"
+          height="100%"
           :empty-text="networkDriverEmptyText"
           table-layout="fixed"
           :fit="true"

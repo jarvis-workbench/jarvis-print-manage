@@ -13,6 +13,29 @@
       return
     }
 
+    function Normalize-DriverKey {
+      param([string]$Value)
+      return ([string]$Value).Trim().ToLowerInvariant()
+    }
+
+    function Resolve-DriverInfPath {
+      param([string]$InfPath)
+      $rawPath = [string]$InfPath
+      if (-not $rawPath) {
+        return ''
+      }
+      if ($rawPath -match '(?i)^[a-z]:\\') {
+        return $rawPath
+      }
+      if ($rawPath -match '(?i)\.inf$') {
+        $candidate = Join-Path $env:WINDIR (Join-Path 'INF' $rawPath)
+        if (Test-Path -LiteralPath $candidate) {
+          return $candidate
+        }
+      }
+      return $rawPath
+    }
+
     $printers = @(Get-Printer -ErrorAction SilentlyContinue | Select-Object Name, DriverName, PortName, Shared, ShareName, PrinterStatus, WorkOffline)
     $drivers = @(Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object Name, Manufacturer, MajorVersion, DriverVersion, InfPath, PrinterEnvironment)
     $ports = @(Get-PrinterPort -ErrorAction SilentlyContinue | Select-Object Name, PrinterHostAddress, PortNumber)
@@ -21,6 +44,22 @@
     foreach ($port in $ports) {
       if ($port -and $port.Name) {
         $portMap[$port.Name] = $port
+      }
+    }
+
+    $driverMap = @{}
+    foreach ($driver in $drivers) {
+      $driverKey = Normalize-DriverKey $driver.Name
+      if ($driverKey -and -not $driverMap.ContainsKey($driverKey)) {
+        $driverMap[$driverKey] = $driver
+      }
+    }
+
+    $wmiDriverMap = @{}
+    foreach ($wmiDriver in (Get-CimInstance -ClassName Win32_PrinterDriver -ErrorAction SilentlyContinue)) {
+      $driverKey = Normalize-DriverKey $wmiDriver.Name
+      if ($driverKey -and -not $wmiDriverMap.ContainsKey($driverKey)) {
+        $wmiDriverMap[$driverKey] = $wmiDriver
       }
     }
 
@@ -39,7 +78,25 @@
     }
 
     $result = foreach ($printer in $printers) {
-      $driver = $drivers | Where-Object { $_.Name -eq $printer.DriverName } | Select-Object -First 1
+      $driverKey = Normalize-DriverKey $printer.DriverName
+      $driver = $null
+      if ($driverKey -and $driverMap.ContainsKey($driverKey)) {
+        $driver = $driverMap[$driverKey]
+      }
+
+      $wmiDriver = $null
+      if ($driverKey -and $wmiDriverMap.ContainsKey($driverKey)) {
+        $wmiDriver = $wmiDriverMap[$driverKey]
+      }
+
+      $driverInfPath = ''
+      if ($driver) {
+        $driverInfPath = Resolve-DriverInfPath $driver.InfPath
+      }
+      if (-not $driverInfPath -and $wmiDriver) {
+        $driverInfPath = Resolve-DriverInfPath $wmiDriver.InfName
+      }
+
       $port = $null
       if ($portMap.ContainsKey($printer.PortName)) {
         $port = $portMap[$printer.PortName]
@@ -94,14 +151,14 @@
         usbPid = $usbPid
         usbVidPid = $usbVidPid
         deviceSerial = $deviceSerial
-        driver = if ($driver) {
+        driver = if ($driver -or $wmiDriver) {
           [PSCustomObject]@{
-            name = $driver.Name
-            manufacturer = $driver.Manufacturer
-            majorVersion = $driver.MajorVersion
-            driverVersion = $driver.DriverVersion
-            infPath = $driver.InfPath
-            environment = $driver.PrinterEnvironment
+            name = if ($driver) { $driver.Name } elseif ($wmiDriver) { $wmiDriver.Name } else { [string]$printer.DriverName }
+            manufacturer = if ($driver) { $driver.Manufacturer } elseif ($wmiDriver) { [string]$wmiDriver.Manufacturer } else { '' }
+            majorVersion = if ($driver) { $driver.MajorVersion } else { $null }
+            driverVersion = if ($driver) { $driver.DriverVersion } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['DriverVersion']) { [string]$wmiDriver.DriverVersion } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['Version']) { [string]$wmiDriver.Version } else { '' }
+            infPath = $driverInfPath
+            environment = if ($driver) { $driver.PrinterEnvironment } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['SupportedPlatform']) { [string]$wmiDriver.SupportedPlatform } else { '' }
           }
         } else {
           $null
