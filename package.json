@@ -1,7 +1,7 @@
 {
   "name": "jarvis-print-manage",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -61,6 +61,13 @@
     "win": {
       "target": "nsis"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "jarvis-workbench",
+        "repo": "jarvis-print-manage"
+      }
+    ],
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
