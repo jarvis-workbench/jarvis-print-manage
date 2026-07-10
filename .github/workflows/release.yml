@@ -27,7 +27,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CSC_IDENTITY_AUTO_DISCOVERY: false
-      PUBLISH_MODE: ${{ github.ref_type == 'tag' || github.event.inputs.publish == 'true' && 'always' || 'never' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +44,13 @@ jobs:
         run: npm run build:web
 
       - name: Package
-        run: npx electron-builder --publish ${{ env.PUBLISH_MODE }}
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" || "${{ github.event.inputs.publish }}" == "true" ]]; then
+            npx electron-builder --publish always
+          else
+            npx electron-builder --publish never
+          fi
 
       - name: Upload dry-run artifacts
         if: ${{ !(github.ref_type == 'tag' || github.event.inputs.publish == 'true') }}
