@@ -45,9 +45,13 @@ jobs:
         run: npm ci
 
       - name: Configure Electron download mirrors
+        shell: bash
         run: |
-          npm config set electron_mirror https://github.com/electron/electron/releases/download/ --location=project
-          npm config set electron_builder_binaries_mirror https://github.com/electron-userland/electron-builder-binaries/releases/download/ --location=project
+          {
+            echo "shamefully-hoist = true"
+            echo "electron_mirror=https://github.com/electron/electron/releases/download/"
+            echo "electron_builder_binaries_mirror=https://github.com/electron-userland/electron-builder-binaries/releases/download/"
+          } > .npmrc
 
       - name: Build web assets
         run: npm run build:web
