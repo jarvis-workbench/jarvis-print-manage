@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+      PUBLISH_MODE: ${{ github.ref_type == 'tag' || github.event.inputs.publish == 'true' && 'always' || 'never' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web assets
+        run: npm run build:web
+
+      - name: Package
+        run: npx electron-builder --publish ${{ env.PUBLISH_MODE }}
+
+      - name: Upload dry-run artifacts
+        if: ${{ !(github.ref_type == 'tag' || github.event.inputs.publish == 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-print-manage-${{ matrix.os }}
+          path: release/**
