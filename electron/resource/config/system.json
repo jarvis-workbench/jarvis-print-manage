@@ -1,4 +1,18 @@
 {
-  "backupDir": "E:\\codex\\linux\\back\\05",
-  "themeMode": "light"
+  "backupDir": "E:\\codex\\linux\\back\\06",
+  "themeMode": "system",
+  "lanEnabled": true,
+  "printServiceEnabled": false,
+  "printServicePort": 17521,
+  "printServiceAuthToken": "",
+  "feature": {
+    "backup": {
+      "archiveEnabled": true
+    },
+    "lan": {
+      "discoveryEnabled": true,
+      "transferEnabled": false,
+      "autoInstallEnabled": false
+    }
+  }
 }

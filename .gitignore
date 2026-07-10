@@ -13,6 +13,10 @@ dist
 dist-ssr
 *.local
 
+# Local backup and scratch files
+scripts/printer-reg-backup/
+scripts/*.txt
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

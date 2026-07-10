@@ -1,0 +1,248 @@
+{
+  "version": "2.9",
+  "children": [
+    {
+      "type": "frame",
+      "id": "0rP2F",
+      "x": 0,
+      "y": 0,
+      "name": "WeChat Login",
+      "clip": true,
+      "width": 375,
+      "height": 812,
+      "fill": "#FFFFFF",
+      "layout": "vertical",
+      "gap": 14,
+      "padding": 24,
+      "children": [
+        {
+          "type": "frame",
+          "id": "qAWGx",
+          "name": "TopSpace",
+          "width": "fill_container",
+          "height": 40
+        },
+        {
+          "type": "frame",
+          "id": "hhSMR",
+          "name": "Logo",
+          "width": 72,
+          "height": 72,
+          "fill": "#07C160",
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "9ViHb",
+              "name": "logoText",
+              "fill": "#FFFFFF",
+              "content": "WX",
+              "fontFamily": "Inter",
+              "fontSize": 20,
+              "fontWeight": "bold"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "id": "Rgznu",
+          "name": "title",
+          "fill": "#111111",
+          "content": "Welcome Back",
+          "fontFamily": "Inter",
+          "fontSize": 30,
+          "fontWeight": "bold"
+        },
+        {
+          "type": "text",
+          "id": "GBnWf",
+          "name": "subtitle",
+          "fill": "#666666",
+          "content": "Sign in to continue",
+          "fontFamily": "Inter",
+          "fontSize": 14,
+          "fontWeight": "normal"
+        },
+        {
+          "type": "frame",
+          "id": "fZCBE",
+          "name": "PhoneRow",
+          "width": "fill_container",
+          "height": 52,
+          "fill": "#F5F6F7",
+          "gap": 10,
+          "padding": 14,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "OGI6x",
+              "name": "cc",
+              "fill": "#111111",
+              "content": "+86",
+              "fontFamily": "Inter",
+              "fontSize": 16,
+              "fontWeight": "medium"
+            },
+            {
+              "type": "frame",
+              "id": "xWfrI",
+              "name": "divider",
+              "width": 1,
+              "height": 24,
+              "fill": "#D9D9D9"
+            },
+            {
+              "type": "text",
+              "id": "VA9Zd",
+              "name": "phoneInput",
+              "fill": "#999999",
+              "content": "Phone number",
+              "fontFamily": "Inter",
+              "fontSize": 16,
+              "fontWeight": "normal"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "R0Msz",
+          "name": "CaptchaRow",
+          "width": "fill_container",
+          "height": 52,
+          "gap": 10,
+          "children": [
+            {
+              "type": "frame",
+              "id": "yY68z",
+              "name": "captchaInput",
+              "width": 220,
+              "height": "fill_container",
+              "fill": "#F5F6F7",
+              "padding": 14,
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "QKKBb",
+                  "name": "captchaText",
+                  "fill": "#999999",
+                  "content": "Verification code",
+                  "fontFamily": "Inter",
+                  "fontSize": 16,
+                  "fontWeight": "normal"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "id": "NtUhK",
+              "name": "sendBtn",
+              "width": "fill_container",
+              "height": "fill_container",
+              "fill": "#E8F7EF",
+              "justifyContent": "center",
+              "alignItems": "center",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "OFHRT",
+                  "name": "sendText",
+                  "fill": "#07C160",
+                  "content": "Get Code",
+                  "fontFamily": "Inter",
+                  "fontSize": 14,
+                  "fontWeight": "bold"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "2WK9i",
+          "name": "primaryBtn",
+          "width": "fill_container",
+          "height": 50,
+          "fill": "#07C160",
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "X7r0f",
+              "name": "primaryTxt",
+              "fill": "#FFFFFF",
+              "content": "WeChat Login",
+              "fontFamily": "Inter",
+              "fontSize": 17,
+              "fontWeight": "bold"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "QUUSe",
+          "name": "secondaryBtn",
+          "width": "fill_container",
+          "height": 50,
+          "fill": "#FFFFFF",
+          "stroke": {
+            "thickness": 1,
+            "fill": "#07C160"
+          },
+          "justifyContent": "center",
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "l6s1I",
+              "name": "secondaryTxt",
+              "fill": "#07C160",
+              "content": "Phone Quick Login",
+              "fontFamily": "Inter",
+              "fontSize": 16,
+              "fontWeight": "bold"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "ZPg64",
+          "name": "policyRow",
+          "width": "fill_container",
+          "gap": 8,
+          "padding": 4,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "frame",
+              "id": "ZrJm8",
+              "name": "checkbox",
+              "width": 16,
+              "height": 16,
+              "fill": "#FFFFFF",
+              "stroke": {
+                "thickness": 1,
+                "fill": "#C8C8C8"
+              }
+            },
+            {
+              "type": "text",
+              "id": "JvkTd",
+              "name": "policyText",
+              "fill": "#666666",
+              "textGrowth": "fixed-width",
+              "width": "fill_container",
+              "content": "I agree to User Agreement and Privacy Policy",
+              "fontFamily": "Inter",
+              "fontSize": 12,
+              "fontWeight": "normal"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

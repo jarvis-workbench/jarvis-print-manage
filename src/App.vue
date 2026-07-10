@@ -35,7 +35,7 @@ onUnmounted(() => {
   <el-container class="shell">
     <el-aside class="sidebar" width="172px">
       <div class="brand">虹色图文助手</div>
-      <div class="brand-subtitle">图文行业-计算机一站式解决方案</div>
+      <div class="brand-subtitle">计算机一站式解决工具</div>
 
       <el-menu class="nav-menu" :default-active="activePath" @select="handleMenuSelect">
         <el-menu-item index="/">
