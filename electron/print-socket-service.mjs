@@ -283,6 +283,13 @@ export function createPrintSocketService({
     )
   }
 
+  async function submitJobAndEmitResult(socket, payload, emitResult, ack = null) {
+    const job = orchestrator.submitJob(payload, { run: executeJob })
+    const finalJob = await orchestrator.waitForJob(job.taskId)
+    emitResult(socket, finalJob, ack)
+    return finalJob
+  }
+
   function emitRenderJobResult(socket, job, eventPrefix, ack = null) {
     if (String(job?.status || '').toUpperCase() === 'DONE') {
       emitSocketEvent(socket, `${eventPrefix}-success`, {
@@ -319,9 +326,7 @@ export function createPrintSocketService({
       rePrintAble: rawPayload?.rePrintAble !== false,
     }
 
-    const job = orchestrator.submitJob(payload, { run: executeJob })
-    emitNewsJobResult(socket, job, ack)
-    return job
+    return submitJobAndEmitResult(socket, payload, emitNewsJobResult, ack)
   }
 
   async function handleRenderJob(socket, args = [], {
@@ -336,9 +341,12 @@ export function createPrintSocketService({
       template: rawPayload?.template,
       pageSize: normalizeSocketPayload(rawPayload?.pageSize),
     }
-    const job = orchestrator.submitJob(payload, { run: executeJob })
-    emitRenderJobResult(socket, job, eventPrefix, ack)
-    return job
+    return submitJobAndEmitResult(
+      socket,
+      payload,
+      (targetSocket, finalJob, finalAck) => emitRenderJobResult(targetSocket, finalJob, eventPrefix, finalAck),
+      ack,
+    )
   }
 
   function createConnectionMiddleware() {

@@ -76,12 +76,20 @@ export function createPrintTaskOrchestrator({
 } = {}) {
   const runtime = {
     jobMap: new Map(),
+    waiters: new Map(),
     maxJobs: Math.max(Number(maxJobs) || 0, 50),
   }
 
   function emitJob(job) {
     if (typeof onJobUpdated === 'function') {
       onJobUpdated(job)
+    }
+    const waiters = runtime.waiters.get(job.taskId)
+    if (waiters && TERMINAL_JOB_STATUS.has(job.status)) {
+      runtime.waiters.delete(job.taskId)
+      for (const resolve of waiters) {
+        resolve(job)
+      }
     }
   }
 
@@ -199,6 +207,34 @@ export function createPrintTaskOrchestrator({
     return running
   }
 
+  function waitForJob(taskId) {
+    const existing = getJob(taskId)
+    if (TERMINAL_JOB_STATUS.has(existing.status)) {
+      return Promise.resolve(existing)
+    }
+
+    return new Promise((resolve) => {
+      const wrappedResolve = (job) => {
+        clearTimeout(timeout)
+        resolve(job)
+      }
+
+      const timeout = setTimeout(() => {
+        const waiters = runtime.waiters.get(existing.taskId) || []
+        const nextWaiters = waiters.filter((item) => item !== wrappedResolve)
+        if (nextWaiters.length) {
+          runtime.waiters.set(existing.taskId, nextWaiters)
+        } else {
+          runtime.waiters.delete(existing.taskId)
+        }
+        resolve(getJob(existing.taskId))
+      }, 120_000)
+
+      const waiters = runtime.waiters.get(existing.taskId) || []
+      runtime.waiters.set(existing.taskId, [...waiters, wrappedResolve])
+    })
+  }
+
   function cancelJob(taskId) {
     const existing = getJob(taskId)
     if (TERMINAL_JOB_STATUS.has(existing.status)) {
@@ -221,6 +257,7 @@ export function createPrintTaskOrchestrator({
 
   return {
     getJob,
+    waitForJob,
     listJobs,
     submitJob,
     cancelJob,

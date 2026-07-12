@@ -11,6 +11,7 @@ import { loadPsScript } from './config/script/ps/index.mjs'
 import { createLanRuntime } from './lan/runtime.mjs'
 import { createPrintSocketService } from './print-socket-service.mjs'
 import { runPowerShell, runPowerShellJson } from './powershell.mjs'
+import { runRenderTask } from './worker/print-render-task.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -346,11 +347,23 @@ function getResourceRootPath() {
   return app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resource')
 }
 
+function getWritableConfigRootPath() {
+  return app.isPackaged ? app.getPath('userData') : getResourceRootPath()
+}
+
 function getSettingsFilePath() {
+  return path.join(getWritableConfigRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
+}
+
+function getDefaultSettingsFilePath() {
   return path.join(getResourceRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
 }
 
 function getVirtualPrinterConfigPath() {
+  return path.join(getWritableConfigRootPath(), VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH)
+}
+
+function getDefaultVirtualPrinterConfigPath() {
   return path.join(getResourceRootPath(), VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH)
 }
 
@@ -360,7 +373,8 @@ function getIndexFilePath(backupDir) {
 
 function normalizeArchiveFields(entry = {}) {
   const archiveFileName = String(entry.archiveFileName || '').trim()
-  const archiveRelativePath = String(entry.archiveRelativePath || archiveFileName).trim()
+  const rawArchiveRelativePath = String(entry.archiveRelativePath || archiveFileName).trim()
+  const archiveRelativePath = normalizeArchiveRelativePath(rawArchiveRelativePath)
   const archiveSha256 = String(entry.archiveSha256 || '').trim().toLowerCase()
   const archiveSizeRaw = Number(entry.archiveSize)
   const archiveSize = Number.isFinite(archiveSizeRaw) && archiveSizeRaw > 0 ? archiveSizeRaw : 0
@@ -374,6 +388,34 @@ function normalizeArchiveFields(entry = {}) {
     archiveFormat,
     extractPolicy,
   }
+}
+
+function normalizeArchiveRelativePath(value) {
+  const text = String(value || '').trim()
+  if (!text || path.isAbsolute(text)) return ''
+  const normalized = path.normalize(text)
+  if (
+    normalized === '..'
+    || normalized.startsWith(`..${path.sep}`)
+    || normalized.includes(`${path.sep}..${path.sep}`)
+  ) {
+    return ''
+  }
+  return normalized
+}
+
+function resolvePathInsideRoot(rootDir, relativePath) {
+  const rawRoot = String(rootDir || '').trim()
+  if (!rawRoot) return ''
+  const root = path.resolve(rawRoot)
+  const rel = normalizeArchiveRelativePath(relativePath)
+  if (!root || !rel) return ''
+  const target = path.resolve(root, rel)
+  const relative = path.relative(root, target)
+  if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    return ''
+  }
+  return target
 }
 
 function isTransientLanArchivePath(value) {
@@ -492,7 +534,7 @@ function resolveEntryArchivePath(backupDir, entry = {}) {
   const archive = normalizeArchiveFields(entry)
   const archiveRel = archive.archiveRelativePath || archive.archiveFileName
   if (!archiveRel) return ''
-  return path.join(backupDir, archiveRel)
+  return resolvePathInsideRoot(backupDir, archiveRel)
 }
 
 async function extractBackupArchive(archivePath, taskId) {
@@ -714,7 +756,12 @@ async function readVirtualPrinterConfig() {
     const fileText = await fs.readFile(getVirtualPrinterConfigPath(), 'utf-8')
     return normalizeVirtualPrinterConfig(JSON.parse(fileText))
   } catch {
-    return normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
+    try {
+      const fileText = await fs.readFile(getDefaultVirtualPrinterConfigPath(), 'utf-8')
+      return normalizeVirtualPrinterConfig(JSON.parse(fileText))
+    } catch {
+      return normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
+    }
   }
 }
 
@@ -1082,38 +1129,58 @@ async function normalizeIndexDriverVersions(backupDir, indexObj) {
   })
 }
 
-async function readSettings() {
-  try {
-    const fileText = await fs.readFile(getSettingsFilePath(), 'utf-8')
-    const parsed = JSON.parse(fileText)
-    const feature = normalizeFeatureSettings(parsed?.feature)
-    const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
-    feature.lan.discoveryEnabled = lanEnabled
-    const backupDir = resolveBackupDirPath(parsed?.backupDir)
-    const printServiceEnabled = toBool(parsed?.printServiceEnabled, false)
-    const printServicePort = normalizePrintServicePort(parsed?.printServicePort, DEFAULT_PRINT_SERVICE_PORT)
-    const printServiceAuthToken = String(parsed?.printServiceAuthToken || '').trim()
-    return {
-      backupDir,
-      themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
-      lanEnabled,
-      printServiceEnabled,
-      printServicePort,
-      printServiceAuthToken,
-      feature,
-    }
-  } catch {
-    const feature = normalizeFeatureSettings()
-    return {
-      backupDir: getDefaultBackupDir(),
-      themeMode: 'system',
-      lanEnabled: feature.lan.discoveryEnabled,
-      printServiceEnabled: false,
-      printServicePort: DEFAULT_PRINT_SERVICE_PORT,
-      printServiceAuthToken: '',
-      feature,
-    }
+function normalizeSettings(raw = {}) {
+  const parsed = raw && typeof raw === 'object' ? raw : {}
+  const feature = normalizeFeatureSettings(parsed?.feature)
+  const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
+  feature.lan.discoveryEnabled = lanEnabled
+  const backupDir = resolveBackupDirPath(parsed?.backupDir)
+  const printServiceEnabled = toBool(parsed?.printServiceEnabled, false)
+  const printServicePort = normalizePrintServicePort(parsed?.printServicePort, DEFAULT_PRINT_SERVICE_PORT)
+  const printServiceAuthToken = String(parsed?.printServiceAuthToken || '').trim()
+  return {
+    backupDir,
+    themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
+    lanEnabled,
+    printServiceEnabled,
+    printServicePort,
+    printServiceAuthToken,
+    feature,
   }
+}
+
+function getFallbackSettings() {
+  const feature = normalizeFeatureSettings()
+  return {
+    backupDir: getDefaultBackupDir(),
+    themeMode: 'system',
+    lanEnabled: feature.lan.discoveryEnabled,
+    printServiceEnabled: false,
+    printServicePort: DEFAULT_PRINT_SERVICE_PORT,
+    printServiceAuthToken: '',
+    feature,
+  }
+}
+
+async function readJsonFileIfExists(filePath) {
+  try {
+    const fileText = await fs.readFile(filePath, 'utf-8')
+    return JSON.parse(fileText)
+  } catch {
+    return null
+  }
+}
+
+async function readSettings() {
+  const writableSettings = await readJsonFileIfExists(getSettingsFilePath())
+  if (writableSettings) {
+    return normalizeSettings(writableSettings)
+  }
+  const defaultSettings = await readJsonFileIfExists(getDefaultSettingsFilePath())
+  if (defaultSettings) {
+    return normalizeSettings(defaultSettings)
+  }
+  return getFallbackSettings()
 }
 
 async function writeSettings(nextSettings) {
@@ -1186,7 +1253,8 @@ function toLanOfferRecord({ entry = {}, backupDir = '', nodeId = '' } = {}) {
   const archiveRelativePath = String(archive.archiveRelativePath || archive.archiveFileName || '').trim()
   if (!archiveRelativePath) return null
   const archiveFileName = String(archive.archiveFileName || path.basename(archiveRelativePath)).trim()
-  const archivePath = path.join(backupDir, archiveRelativePath)
+  const archivePath = resolvePathInsideRoot(backupDir, archiveRelativePath)
+  if (!archivePath) return null
   const identityKey = buildIndexIdentityKey(entry)
     || `${String(entry.driverName || '').trim().toLowerCase()}::${String(entry.printerName || '').trim().toLowerCase()}`
   return {
@@ -1276,7 +1344,8 @@ async function resolveLanOfferArchive({ offerId = '', nodeId = '' } = {}) {
   if (!matched) return null
   const settings = await readSettings()
   const backupDir = await ensureWritableBackupDir(settings?.backupDir)
-  const archivePath = path.join(backupDir, String(matched.archiveRelativePath || ''))
+  const archivePath = resolvePathInsideRoot(backupDir, String(matched.archiveRelativePath || ''))
+  if (!archivePath) return null
   const archiveExists = await isFileExists(archivePath)
   if (!archiveExists) return null
   return {
@@ -1430,7 +1499,10 @@ async function installLanOfferFromRemote({
   const actualSha256 = String(downloadResult?.sha256 || '').toLowerCase()
   const expectedSha256 = String(offer?.archiveSha256 || '').trim().toLowerCase()
   if (expectedSha256 && actualSha256 && expectedSha256 !== actualSha256) {
-    logWarn(`[lan-install] archive hash mismatch, continue with downloaded file. expected=${expectedSha256}, actual=${actualSha256}`)
+    throw createArchiveError(
+      'ARCHIVE_HASH_MISMATCH',
+      `远端驱动包哈希不匹配。expected=${expectedSha256}, actual=${actualSha256}`,
+    )
   }
 
   const actualSize = Number(downloadResult?.size) || 0
@@ -1459,7 +1531,7 @@ async function installLanOfferFromRemote({
     deviceSerial: String(offer?.deviceSerial || ''),
     archiveFileName: '',
     archiveRelativePath: '',
-    archiveSha256: actualSha256 || expectedSha256,
+    archiveSha256: expectedSha256 || actualSha256,
     archiveSize: actualSize || expectedSize,
     archiveFormat: String(offer?.archiveFormat || ARCHIVE_FORMAT || ''),
     extractPolicy: ARCHIVE_EXTRACT_POLICY_DEFAULT,
@@ -1581,6 +1653,7 @@ function ensurePrintSocketService() {
   printSocketService = createPrintSocketService({
     appVersion: app.getVersion(),
     onListPrinters: async () => getInstalledPrinters(),
+    onExecuteJob: async (job, payload) => executePrintSocketJob(job, payload),
     onStateChanged: (state) => {
       broadcastPrintServiceState(state)
     },
@@ -1592,6 +1665,78 @@ function ensurePrintSocketService() {
     },
   })
   return printSocketService
+}
+
+async function executePrintSocketJob(job = {}, payload = {}) {
+  const type = String(job?.type || payload?.type || '').trim()
+  if (type === 'html') {
+    return printHtmlSocketJob(job, payload)
+  }
+
+  const result = await runRenderTask({
+    ...payload,
+    taskId: String(job?.taskId || ''),
+    templateId: String(job?.templateId || payload?.templateId || ''),
+    type,
+    printer: String(job?.printer || payload?.printer || ''),
+  })
+  if (result?.ok === false) {
+    const error = new Error(String(result?.message || 'Print execution failed.'))
+    error.code = String(result?.code || 'PRINT_EXEC_FAILED')
+    error.result = result
+    throw error
+  }
+  return result ?? null
+}
+
+async function printHtmlSocketJob(job = {}, payload = {}) {
+  const html = String(payload?.html || '').trim()
+  if (!html) {
+    const error = new Error('HTML print payload is empty.')
+    error.code = 'PAYLOAD_INVALID'
+    throw error
+  }
+
+  const printWindow = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+
+  try {
+    const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
+    await printWindow.loadURL(dataUrl)
+    const printResult = await new Promise((resolve, reject) => {
+      const options = {
+        silent: payload?.silent === true,
+        printBackground: true,
+        deviceName: String(job?.printer || payload?.printer || '').trim(),
+        copies: Math.max(Number(payload?.copies) || 1, 1),
+      }
+      printWindow.webContents.print(options, (success, failureReason) => {
+        if (success) {
+          resolve({
+            ok: true,
+            taskId: String(job?.taskId || ''),
+            templateId: String(job?.templateId || payload?.templateId || ''),
+            printer: options.deviceName,
+          })
+          return
+        }
+        const error = new Error(String(failureReason || 'HTML print failed.'))
+        error.code = 'PRINT_EXEC_FAILED'
+        reject(error)
+      })
+    })
+    return printResult
+  } finally {
+    if (!printWindow.isDestroyed()) {
+      printWindow.destroy()
+    }
+  }
 }
 
 async function applyPrintServiceSettings(settings = {}) {
@@ -1761,7 +1906,7 @@ async function backupPrinterDriver({ printerName, backupDir }) {
       ...result,
       ...metadata,
       backupDir: targetRoot,
-      archivePath: path.join(targetRoot, metadata.archiveRelativePath || metadata.archiveFileName || ''),
+      archivePath: resolveEntryArchivePath(targetRoot, metadata),
     }
   } finally {
     if (String(backupPath || '').trim()) {
@@ -1826,8 +1971,6 @@ async function installPrinterFromArchive({
 
   let backupPath = ''
   let extractDir = ''
-  let installSucceeded = false
-
   try {
     const taskId = `install-${Date.now()}-${randomUUID().split('-')[0]}`
     const extracted = await extractBackupArchive(normalizedArchivePath, taskId)
@@ -1882,10 +2025,9 @@ async function installPrinterFromArchive({
   })
   try {
     const result = await runPowerShellJson(script, { timeoutMs: 120_000 })
-    installSucceeded = true
     return result
   } finally {
-    if (extractDir && installSucceeded) {
+    if (extractDir) {
       await safeCleanupExtractDir(extractDir)
     }
   }
@@ -1986,9 +2128,11 @@ async function deleteBackupDriver({ printerName, backupDir }) {
       return nextArchiveRel && nextArchiveRel.toLowerCase() === archiveRel.toLowerCase()
     })
     if (!archiveInUse) {
-      const archivePath = path.join(targetRoot, archiveRel)
-      await fs.rm(archivePath, { force: true })
-      archiveDeleted = true
+      const archivePath = resolvePathInsideRoot(targetRoot, archiveRel)
+      if (archivePath) {
+        await fs.rm(archivePath, { force: true })
+        archiveDeleted = true
+      }
     }
   }
 

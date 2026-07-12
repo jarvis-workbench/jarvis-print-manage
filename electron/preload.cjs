@@ -3,6 +3,8 @@
 contextBridge.exposeInMainWorld('eleDrive', {
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
+  getVirtualPrinterConfig: () => ipcRenderer.invoke('settings:get-virtual-printer-config'),
+  setVirtualPrinterConfig: (payload) => ipcRenderer.invoke('settings:set-virtual-printer-config', payload),
   setBackupDir: (backupDir) => ipcRenderer.invoke('settings:set-backup-dir', backupDir),
   setThemeMode: (themeMode) => ipcRenderer.invoke('settings:set-theme-mode', themeMode),
   chooseBackupDir: () => ipcRenderer.invoke('settings:choose-backup-dir'),
@@ -29,6 +31,7 @@ contextBridge.exposeInMainWorld('eleDrive', {
   openSystemAddPrinterWizard: () => ipcRenderer.invoke('printers:open-system-add-wizard'),
   openPrinterProperties: (payload) => ipcRenderer.invoke('printers:open-properties', payload),
   openPrinterPreferences: (payload) => ipcRenderer.invoke('printers:open-preferences', payload),
+  renamePrinter: (payload) => ipcRenderer.invoke('printers:rename', payload),
   backupPrinterDriver: (payload) => ipcRenderer.invoke('printers:backup-driver', payload),
   installPrinter: (payload) => ipcRenderer.invoke('printers:install', payload),
   pingHost: (payload) => ipcRenderer.invoke('printers:ping-host', payload),

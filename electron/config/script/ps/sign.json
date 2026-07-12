@@ -25,8 +25,8 @@
     },
     "printer-list-installed": {
       "file": "printer-list-installed.scps1",
-      "hash": "81db376e2313c49472912662a04537691ec75dad290402f89fa6982cc288ca66",
-      "appHash": "e303b1299bbf60bfe01ea5941e97028b5955c12886a6a3908f465e93c8cb995e"
+      "hash": "ee145219c0587b6c97836e64c6282297ffad2e48188b56cd027061f51aa20cc5",
+      "appHash": "02f5870d7273a2f86ff367d17618a0dd2c021ef62e880424e4fe4ca57b989e91"
     },
     "printer-list-usb-ports": {
       "file": "printer-list-usb-ports.scps1",
