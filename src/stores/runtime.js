@@ -89,6 +89,22 @@ function createEmptyPrintServiceState() {
   }
 }
 
+function createEmptyUpdateStatus() {
+  return {
+    phase: 'idle',
+    currentVersion: '',
+    availableVersion: '',
+    releaseDate: '',
+    releaseName: '',
+    releaseNotes: '',
+    progress: null,
+    errorText: '',
+    isPackaged: false,
+    platform: '',
+    updatedAt: '',
+  }
+}
+
 function normalizePrintJob(item = {}) {
   return {
     taskId: String(item?.taskId || ''),
@@ -409,6 +425,7 @@ export const useRuntimeStore = defineStore('runtime', {
     lanTasks: [],
     lanPairState: createEmptyLanPairState(),
     printServiceState: createEmptyPrintServiceState(),
+    appUpdateStatus: createEmptyUpdateStatus(),
     printJobs: [],
     printProtocolVersion: 1,
     usbPorts: [],
@@ -508,6 +525,38 @@ export const useRuntimeStore = defineStore('runtime', {
         printServiceEnabled: nextState.enabled,
       }
       this.lastSyncAt = new Date().toISOString()
+    },
+    setUpdateStatus(payload = {}) {
+      this.appUpdateStatus = {
+        ...createEmptyUpdateStatus(),
+        ...payload,
+        progress: payload?.progress || null,
+      }
+      this.lastSyncAt = new Date().toISOString()
+    },
+    async loadUpdateStatus() {
+      if (!window.eleDrive?.getUpdateStatus) return this.appUpdateStatus
+      const status = await window.eleDrive.getUpdateStatus()
+      this.setUpdateStatus(status || {})
+      return this.appUpdateStatus
+    },
+    async checkForUpdates() {
+      if (!window.eleDrive?.checkForUpdates) return this.appUpdateStatus
+      const status = await window.eleDrive.checkForUpdates()
+      this.setUpdateStatus(status || {})
+      return this.appUpdateStatus
+    },
+    async downloadUpdate() {
+      if (!window.eleDrive?.downloadUpdate) return this.appUpdateStatus
+      const status = await window.eleDrive.downloadUpdate()
+      this.setUpdateStatus(status || {})
+      return this.appUpdateStatus
+    },
+    async quitAndInstallUpdate() {
+      if (!window.eleDrive?.quitAndInstallUpdate) return this.appUpdateStatus
+      const status = await window.eleDrive.quitAndInstallUpdate()
+      this.setUpdateStatus(status || {})
+      return this.appUpdateStatus
     },
     setPrintJobs(list = []) {
       const normalized = (Array.isArray(list) ? list : [])

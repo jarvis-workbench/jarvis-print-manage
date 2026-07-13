@@ -2,6 +2,10 @@
 
 contextBridge.exposeInMainWorld('eleDrive', {
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),
+  getUpdateStatus: () => ipcRenderer.invoke('updates:get-status'),
+  checkForUpdates: () => ipcRenderer.invoke('updates:check-for-updates'),
+  downloadUpdate: () => ipcRenderer.invoke('updates:download-update'),
+  quitAndInstallUpdate: () => ipcRenderer.invoke('updates:quit-and-install'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   getVirtualPrinterConfig: () => ipcRenderer.invoke('settings:get-virtual-printer-config'),
   setVirtualPrinterConfig: (payload) => ipcRenderer.invoke('settings:set-virtual-printer-config', payload),
@@ -44,6 +48,12 @@ contextBridge.exposeInMainWorld('eleDrive', {
     const listener = (_, payload) => handler(payload)
     ipcRenderer.on('app:navigate', listener)
     return () => ipcRenderer.removeListener('app:navigate', listener)
+  },
+  onUpdateStatusChanged: (handler) => {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_, payload) => handler(payload)
+    ipcRenderer.on('updates:status-changed', listener)
+    return () => ipcRenderer.removeListener('updates:status-changed', listener)
   },
   onPrinterStateUpdated: (handler) => {
     if (typeof handler !== 'function') return () => {}

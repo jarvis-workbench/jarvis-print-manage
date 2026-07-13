@@ -11,12 +11,13 @@ import { loadPsScript } from './config/script/ps/index.mjs'
 import { createLanRuntime } from './lan/runtime.mjs'
 import { createPrintSocketService } from './print-socket-service.mjs'
 import { runPowerShell, runPowerShellJson } from './powershell.mjs'
+import { UpdateManager } from './update-manager.mjs'
 import { runRenderTask } from './worker/print-render-task.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
-const APP_TITLE = '虹色图文助手'
+const APP_TITLE = '打印机助手'
 const THEME_MODES = new Set(['light', 'dark', 'system'])
 const INDEX_FILE_NAME = 'driver-index.json'
 const BACKUP_META_FILE_NAME = 'driver-backup.json'
@@ -110,6 +111,7 @@ let printerSnapshotRefreshRunning = false
 let printerSnapshotRefreshPending = false
 let lanRuntime = null
 let printSocketService = null
+let updateManager = null
 let printerStateWorkerStarting = false
 let virtualPrinterConfigCache = normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
 
@@ -244,6 +246,15 @@ function updatePrinterStateWorkerConfig(payload = {}) {
       },
     })
   } catch {}
+}
+
+function ensureUpdateManager() {
+  if (updateManager) return updateManager
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('主窗口尚未就绪')
+  }
+  updateManager = new UpdateManager(mainWindow)
+  return updateManager
 }
 
 function stopPrinterStateWorker() {
@@ -2470,6 +2481,17 @@ if (!gotSingleInstanceLock) {
     }
 
     upsertIpcHandler('app:get-version', () => app.getVersion())
+    upsertIpcHandler('updates:get-status', async () => ensureUpdateManager().getStatus())
+    upsertIpcHandler('updates:check-for-updates', async () => ensureUpdateManager().checkForUpdates())
+    upsertIpcHandler('updates:download-update', async () => ensureUpdateManager().downloadUpdate())
+    upsertIpcHandler('updates:quit-and-install', async () => {
+      const manager = ensureUpdateManager()
+      if (manager.getStatus()?.phase !== 'downloaded') {
+        return manager.quitAndInstall()
+      }
+      appIsQuitting = true
+      return manager.quitAndInstall()
+    })
 
     upsertIpcHandler('settings:get', async () => readSettings())
     upsertIpcHandler('settings:get-virtual-printer-config', async () => ({
@@ -2734,7 +2756,8 @@ if (!gotSingleInstanceLock) {
       }
     })
 
-    createMainWindow()
+    const win = createMainWindow()
+    updateManager = new UpdateManager(win)
     createTray()
     startPrinterStateWorker({
       backupDir: startupSettings.backupDir,

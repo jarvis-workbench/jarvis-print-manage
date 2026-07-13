@@ -1,6 +1,6 @@
 ﻿<script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { FolderOpen } from '@icon-park/vue-next'
+import { Download, FolderOpen } from '@icon-park/vue-next'
 import { ElMessage } from 'element-plus'
 import { applyThemeMode, bindSystemTheme } from '../theme'
 import { useRuntimeStore } from '../stores/runtime'
@@ -10,6 +10,9 @@ const saving = ref(false)
 const lanSaving = ref(false)
 const lanLoading = ref(false)
 const virtualSaving = ref(false)
+const updateChecking = ref(false)
+const updateDownloading = ref(false)
+const updateInstalling = ref(false)
 const backupDir = ref('')
 const themeMode = ref('system')
 const lanEnabled = ref(false)
@@ -23,6 +26,7 @@ const containsPortsInput = ref('')
 const error = ref('')
 const runtimeStore = useRuntimeStore()
 let removeLanStateUpdatedListener = null
+let removeUpdateStatusChangedListener = null
 
 const protocolVersionLabel = computed(() => {
   const raw = String(lanState.value?.protocolVersion || '').trim()
@@ -33,6 +37,20 @@ const protocolVersionLabel = computed(() => {
   if (/^\d+\.\d+\.\d+$/.test(normalized)) return `V${normalized}`
   return `V${normalized}`
 })
+
+const updateStatus = computed(() => runtimeStore.appUpdateStatus)
+const updateProgress = computed(() => Math.round(Number(updateStatus.value?.progress?.percent || 0)))
+const canCheckForUpdates = computed(() => ![
+  'unsupported',
+  'checking',
+  'downloading',
+  'installing',
+].includes(updateStatus.value?.phase))
+const checkUpdateLabel = computed(() => {
+  if (updateStatus.value?.phase === 'unsupported') return '无法检查'
+  return updateStatus.value?.phase === 'idle' ? '检查更新' : '重新检查'
+})
+const canDownloadUpdate = computed(() => updateStatus.value?.phase === 'available')
 
 function parseTokenInput(value) {
   const text = String(value || '')
@@ -87,6 +105,10 @@ function applyLanState(state) {
   runtimeStore.setLanState(payload)
 }
 
+function applyUpdateStatus(status) {
+  runtimeStore.setUpdateStatus(status || {})
+}
+
 async function loadLanState() {
   if (!window.eleDrive?.getLanState) return
   lanLoading.value = true
@@ -108,6 +130,24 @@ function subscribeLanState() {
   removeLanStateUpdatedListener = window.eleDrive.onLanStateUpdated((payload) => {
     applyLanState(payload || {})
   })
+}
+
+function subscribeUpdateStatus() {
+  if (!window.eleDrive?.onUpdateStatusChanged) return
+  if (typeof removeUpdateStatusChangedListener === 'function') {
+    removeUpdateStatusChangedListener()
+  }
+  removeUpdateStatusChangedListener = window.eleDrive.onUpdateStatusChanged((payload) => {
+    applyUpdateStatus(payload || {})
+  })
+}
+
+async function loadUpdateStatus() {
+  try {
+    await runtimeStore.loadUpdateStatus()
+  } catch (err) {
+    error.value = getErrorMessage(err)
+  }
 }
 
 async function handleLanToggle(value) {
@@ -190,12 +230,97 @@ async function saveVirtualPrinterConfig() {
   }
 }
 
+async function checkForUpdates() {
+  if (!canCheckForUpdates.value) {
+    if (updateStatus.value?.phase === 'unsupported') {
+      ElMessage.info(updateStatus.value?.errorText || unsupportedUpdateText())
+    }
+    return
+  }
+
+  updateChecking.value = true
+  error.value = ''
+  try {
+    await runtimeStore.checkForUpdates()
+  } catch (err) {
+    const message = getErrorMessage(err)
+    error.value = message
+    ElMessage.error(message)
+  } finally {
+    updateChecking.value = false
+  }
+}
+
+async function downloadUpdate() {
+  if (!canDownloadUpdate.value) {
+    ElMessage.info(updateStatus.value?.errorText || '暂无可下载的更新')
+    return
+  }
+
+  updateDownloading.value = true
+  error.value = ''
+  try {
+    await runtimeStore.downloadUpdate()
+  } catch (err) {
+    const message = getErrorMessage(err)
+    error.value = message
+    ElMessage.error(message)
+  } finally {
+    updateDownloading.value = false
+  }
+}
+
+async function quitAndInstallUpdate() {
+  updateInstalling.value = true
+  error.value = ''
+  try {
+    await runtimeStore.quitAndInstallUpdate()
+  } catch (err) {
+    const message = getErrorMessage(err)
+    error.value = message
+    ElMessage.error(message)
+    updateInstalling.value = false
+  }
+}
+
+function updatePhaseText() {
+  return {
+    idle: '尚未检查更新',
+    unsupported: updateStatus.value?.errorText || '当前环境不支持自动更新',
+    checking: '正在检查更新',
+    available: '发现新版本，点击更新后开始下载',
+    'not-available': '当前已是最新版本',
+    downloading: '正在下载更新',
+    downloaded: '更新已下载，点击重启安装后完成安装',
+    installing: '正在重启安装',
+    error: '更新检查失败',
+  }[updateStatus.value?.phase] || '尚未检查更新'
+}
+
+function releaseDateText(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+function unsupportedUpdateText() {
+  return updateStatus.value?.isPackaged
+    ? updateStatus.value?.errorText || '当前平台暂不支持自动更新'
+    : '开发模式无法执行真实更新'
+}
+
+function getErrorMessage(err) {
+  return err instanceof Error ? err.message : String(err)
+}
+
 onMounted(async () => {
   subscribeLanState()
+  subscribeUpdateStatus()
   await loadSettings()
   await Promise.all([
     loadLanState(),
     loadVirtualPrinterConfig(),
+    loadUpdateStatus(),
   ])
 })
 
@@ -204,6 +329,10 @@ onUnmounted(() => {
     removeLanStateUpdatedListener()
   }
   removeLanStateUpdatedListener = null
+  if (typeof removeUpdateStatusChangedListener === 'function') {
+    removeUpdateStatusChangedListener()
+  }
+  removeUpdateStatusChangedListener = null
 })
 </script>
 
@@ -347,8 +476,144 @@ onUnmounted(() => {
           </div>
         </el-card>
       </el-tab-pane>
+
+      <el-tab-pane label="更新" name="updates">
+        <div class="settings-update">
+          <div class="settings-update__header">
+            <div>
+              <h2>打印机助手 {{ updateStatus.currentVersion || '未知版本' }}</h2>
+              <p>{{ updatePhaseText() }}</p>
+            </div>
+            <div class="settings-update__actions">
+              <el-button
+                v-if="!['available', 'downloading', 'downloaded'].includes(updateStatus.phase)"
+                :disabled="!canCheckForUpdates || updateChecking"
+                :loading="updateChecking"
+                @click="checkForUpdates"
+              >
+                <download theme="outline" size="16" />
+                {{ checkUpdateLabel }}
+              </el-button>
+              <el-button
+                v-if="updateStatus.phase === 'available'"
+                type="primary"
+                :disabled="!canDownloadUpdate || updateDownloading"
+                :loading="updateDownloading"
+                @click="downloadUpdate"
+              >
+                <download theme="outline" size="16" />
+                更新
+              </el-button>
+              <el-button
+                v-if="updateStatus.phase === 'downloading'"
+                type="primary"
+                disabled
+              >
+                <download theme="outline" size="16" />
+                下载中 {{ updateProgress }}%
+              </el-button>
+              <el-button
+                v-if="updateStatus.phase === 'downloaded'"
+                type="primary"
+                :disabled="updateInstalling"
+                :loading="updateInstalling"
+                @click="quitAndInstallUpdate"
+              >
+                <download theme="outline" size="16" />
+                重启安装
+              </el-button>
+            </div>
+          </div>
+
+          <el-progress
+            v-if="updateStatus.phase === 'downloading' || updateStatus.phase === 'downloaded'"
+            :percentage="updateProgress"
+          />
+
+          <el-descriptions
+            v-if="updateStatus.availableVersion || updateStatus.releaseName || updateStatus.releaseDate || updateStatus.releaseNotes"
+            :column="1"
+            border
+            class="settings-update__details"
+          >
+            <el-descriptions-item v-if="updateStatus.availableVersion" label="可用版本">
+              {{ updateStatus.availableVersion }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="updateStatus.releaseName" label="发布名称">
+              {{ updateStatus.releaseName }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="updateStatus.releaseDate" label="发布时间">
+              {{ releaseDateText(updateStatus.releaseDate) }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="updateStatus.releaseNotes" label="更新说明">
+              <span class="settings-update__notes">{{ updateStatus.releaseNotes }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+
+          <el-alert
+            v-if="updateStatus.phase === 'unsupported'"
+            :title="unsupportedUpdateText()"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <el-alert
+            v-if="updateStatus.phase === 'error'"
+            :title="updateStatus.errorText || '未知错误'"
+            type="error"
+            :closable="false"
+            show-icon
+          />
+        </div>
+      </el-tab-pane>
     </el-tabs>
 
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="status-alert" />
   </el-card>
 </template>
+
+<style scoped>
+.settings-update {
+  display: grid;
+  gap: 18px;
+}
+
+.settings-update__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-update__header h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.settings-update__header p {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+}
+
+.settings-update__actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-update__actions :deep(.el-button) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-update__details {
+  max-width: 720px;
+}
+
+.settings-update__notes {
+  display: inline-block;
+  white-space: pre-wrap;
+}
+</style>

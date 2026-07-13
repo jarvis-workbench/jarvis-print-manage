@@ -110,6 +110,38 @@ interface PrintJob {
   updatedAt: string
 }
 
+type AppUpdatePhase =
+  | 'idle'
+  | 'unsupported'
+  | 'checking'
+  | 'available'
+  | 'not-available'
+  | 'downloading'
+  | 'downloaded'
+  | 'installing'
+  | 'error'
+
+interface AppUpdateProgress {
+  percent: number
+  transferred: number
+  total: number
+  bytesPerSecond: number
+}
+
+interface AppUpdateStatus {
+  phase: AppUpdatePhase
+  currentVersion: string
+  availableVersion?: string
+  releaseDate?: string
+  releaseName?: string
+  releaseNotes?: string
+  progress?: AppUpdateProgress | null
+  errorText?: string
+  isPackaged: boolean
+  platform: string
+  updatedAt: string
+}
+
 interface VirtualPrinterConfig {
   keywords: string[]
   exactPorts: string[]
@@ -216,6 +248,10 @@ interface PrinterRuntimeState {
 interface Window {
   eleDrive?: {
     getAppVersion: () => Promise<string>
+    getUpdateStatus: () => Promise<AppUpdateStatus>
+    checkForUpdates: () => Promise<AppUpdateStatus>
+    downloadUpdate: () => Promise<AppUpdateStatus>
+    quitAndInstallUpdate: () => Promise<AppUpdateStatus>
     getSettings: () => Promise<EleDriveSettings>
     getVirtualPrinterConfig: () => Promise<VirtualPrinterConfig>
     setVirtualPrinterConfig: (payload: Partial<VirtualPrinterConfig>) => Promise<VirtualPrinterConfig>
@@ -346,6 +382,7 @@ interface Window {
       }
     }>
     onTrayNavigate: (handler: (payload: { path?: string } | null) => void) => () => void
+    onUpdateStatusChanged: (handler: (payload: AppUpdateStatus | null) => void) => () => void
     onPrinterStateUpdated: (handler: (payload: PrinterRuntimeState | null) => void) => () => void
     onPrinterSnapshotUpdated: (handler: (payload: PrinterSnapshotPayload | null) => void) => () => void
     onLanStateUpdated: (handler: (payload: LanRuntimeState | null) => void) => () => void

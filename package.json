@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@icon-park/vue-next": "^1.4.2",
+    "electron-updater": "^6.8.9",
     "element-plus": "^2.13.6",
     "pinia": "^3.0.4",
     "socket.io": "^4.8.3",
@@ -39,7 +40,7 @@
   },
   "build": {
     "appId": "cc.eu.iiot.hs.tool",
-    "productName": "虹色图文助手",
+    "productName": "打印机助手",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -57,7 +58,7 @@
     },
     "protocols": [
       {
-        "name": "虹色图文助手协议",
+        "name": "打印机助手协议",
         "schemes": [
           "hstools"
         ]
