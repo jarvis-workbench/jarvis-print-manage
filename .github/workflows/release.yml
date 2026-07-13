@@ -42,18 +42,45 @@ jobs:
       - name: Build web assets
         run: npm run build:web
 
-      - name: Package
+      - name: Package Windows installer
+        run: npx electron-builder --win --publish never
+
+      - name: Publish GitHub Release
+        if: ${{ github.ref_type == 'tag' || github.event.inputs.publish == 'true' }}
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" || "${{ github.event.inputs.publish }}" == "true" ]]; then
-            npx electron-builder --publish always
-          else
-            npx electron-builder --publish never
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          title="${version}"
+
+          mapfile -t assets < <(find release -maxdepth 1 -type f \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) ! -name "*__uninstaller*" | sort)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No release assets found in release/"
+            ls -la release || true
+            exit 1
           fi
+
+          echo "Publishing assets:"
+          printf ' - %s\n' "${assets[@]}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes --cleanup-tag=false
+          fi
+
+          gh release create "$tag" \
+            --title "$title" \
+            --notes "Windows first release ${version}" \
+            --latest \
+            "${assets[@]}"
 
       - name: Upload dry-run artifacts
         if: ${{ !(github.ref_type == 'tag' || github.event.inputs.publish == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: jarvis-print-manage-${{ matrix.os }}
-          path: release/**
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
