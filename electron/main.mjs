@@ -1,5 +1,5 @@
-﻿import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } from 'electron'
-import { createReadStream, createWriteStream, existsSync } from 'node:fs'
+import { app, BrowserWindow } from 'electron'
+import { createReadStream, createWriteStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import http from 'node:http'
@@ -7,6 +7,20 @@ import https from 'node:https'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker } from 'node:worker_threads'
+import { AppShell } from './app-shell.mjs'
+import {
+  DEFAULT_VIRTUAL_PRINTER_CONFIG,
+  ensureStartupBackupDirSetting,
+  ensureWritableBackupDir,
+  normalizeVirtualPrinterConfig,
+  readSettings,
+  readVirtualPrinterConfig,
+  resolveBackupDirPath,
+  toBool,
+  writeSettings,
+  writeVirtualPrinterConfig,
+} from './config-store.mjs'
+import { AppIpcRouter } from './ipc-router.mjs'
 import { loadPsScript } from './config/script/ps/index.mjs'
 import { createLanRuntime } from './lan/runtime.mjs'
 import { createPrintSocketService } from './print-socket-service.mjs'
@@ -23,8 +37,6 @@ const INDEX_FILE_NAME = 'driver-index.json'
 const BACKUP_META_FILE_NAME = 'driver-backup.json'
 const TRAY_ICON_NAME = 'tray.png'
 const PRINTER_STATE_POLL_INTERVAL_MS = 2000
-const SYSTEM_SETTINGS_RELATIVE_PATH = path.join('config', 'system.json')
-const VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH = path.join('config', 'virtual-printer.json')
 const POWERSHELL_TIMEOUT_MS = 30_000
 const ARCHIVE_FORMAT = 'pdrv.zip'
 const ARCHIVE_FILE_SUFFIX = '.pdrv.zip'
@@ -33,41 +45,6 @@ const LAN_SERVICE_ARCHIVE_PATH_PREFIX = '/lan/v1/archive/'
 const LAN_DOWNLOAD_TIMEOUT_MS = 120_000
 const CUSTOM_PROTOCOL_SCHEME = 'hstools'
 const KNOWN_ROUTE_PATHS = new Set(['/', '/printers', '/settings', '/driver-install'])
-const DEFAULT_PRINT_SERVICE_PORT = 17521
-const DEFAULT_FEATURE_SETTINGS = {
-  backup: {
-    archiveEnabled: true,
-  },
-  lan: {
-    discoveryEnabled: false,
-    transferEnabled: false,
-    autoInstallEnabled: false,
-  },
-}
-const DEFAULT_VIRTUAL_PRINTER_CONFIG = {
-  keywords: [
-    'pdf',
-    'xps',
-    'fax',
-    'onenote',
-    'virtual',
-    'document writer',
-    'microsoft print to pdf',
-    'microsoft xps document writer',
-    'adobe pdf',
-    'foxit pdf',
-    'wps pdf',
-    'doro pdf',
-    'cutepdf',
-    'priprinter',
-  ],
-  exactPorts: ['file:', 'portprompt:', 'nul:'],
-  prefixPorts: ['redir', 'ts'],
-  containsPorts: ['prompt'],
-}
-
-let mainWindow = null
-let tray = null
 let appIsQuitting = false
 if (isDev) {
   const devUserDataPath = path.join(app.getPath('appData'), `${app.getName()}-dev`)
@@ -75,7 +52,6 @@ if (isDev) {
 }
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 let printerStateWorker = null
-let pendingProtocolRoutePath = ''
 let printerRuntimeState = {
   seq: 0,
   changedAt: '',
@@ -114,6 +90,7 @@ let printSocketService = null
 let updateManager = null
 let printerStateWorkerStarting = false
 let virtualPrinterConfigCache = normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
+let appShell = null
 
 function isBrokenPipeError(error) {
   if (!error) return false
@@ -143,40 +120,20 @@ function logError(...args) {
   safeConsole('error', ...args)
 }
 
-function upsertIpcHandler(channel, handler) {
-  try {
-    ipcMain.removeHandler(channel)
-  } catch {}
-  ipcMain.handle(channel, handler)
-}
-
-function toBool(value, fallback = false) {
-  if (value === true || value === false) return value
-  if (typeof value === 'string') return value.toLowerCase() === 'true'
-  if (value == null) return fallback
-  return Boolean(value)
-}
-
-function normalizeFeatureSettings(feature = {}) {
-  return {
-    backup: {
-      archiveEnabled: toBool(feature?.backup?.archiveEnabled, DEFAULT_FEATURE_SETTINGS.backup.archiveEnabled),
-    },
-    lan: {
-      discoveryEnabled: toBool(feature?.lan?.discoveryEnabled, DEFAULT_FEATURE_SETTINGS.lan.discoveryEnabled),
-      transferEnabled: toBool(feature?.lan?.transferEnabled, DEFAULT_FEATURE_SETTINGS.lan.transferEnabled),
-      autoInstallEnabled: toBool(feature?.lan?.autoInstallEnabled, DEFAULT_FEATURE_SETTINGS.lan.autoInstallEnabled),
-    },
-  }
-}
-
-function normalizePrintServicePort(value, fallback = DEFAULT_PRINT_SERVICE_PORT) {
-  const port = Number(value)
-  if (!Number.isFinite(port)) return fallback
-  const normalized = Math.trunc(port)
-  if (normalized < 1 || normalized > 65535) return fallback
-  return normalized
-}
+appShell = new AppShell({
+  appTitle: APP_TITLE,
+  customProtocolScheme: CUSTOM_PROTOCOL_SCHEME,
+  dirname: __dirname,
+  isDev,
+  isQuitting: () => appIsQuitting,
+  knownRoutePaths: KNOWN_ROUTE_PATHS,
+  logError,
+  logWarn,
+  setQuitting: (value) => {
+    appIsQuitting = Boolean(value)
+  },
+  trayIconName: TRAY_ICON_NAME,
+})
 
 function broadcastPrinterState() {
   const payload = {
@@ -250,11 +207,53 @@ function updatePrinterStateWorkerConfig(payload = {}) {
 
 function ensureUpdateManager() {
   if (updateManager) return updateManager
-  if (!mainWindow || mainWindow.isDestroyed()) {
+  const win = appShell?.mainWindow
+  if (!win || win.isDestroyed()) {
     throw new Error('主窗口尚未就绪')
   }
-  updateManager = new UpdateManager(mainWindow)
+  updateManager = new UpdateManager(win)
   return updateManager
+}
+
+function registerIpcHandlers() {
+  const router = new AppIpcRouter({
+    appShell,
+    applyLanSettings,
+    applyPrintServiceSettings,
+    backupPrinterDriver,
+    broadcastLanState,
+    deleteBackupDriver,
+    ensureBackupIndex,
+    ensureLanRuntime,
+    ensurePrintSocketService,
+    ensureUpdateManager,
+    ensureWritableBackupDir,
+    filterVirtualOffersFromLanState,
+    filterVirtualPrinterRows,
+    getInstalledPrinters,
+    getPrinterRuntimeState: () => ({ ...printerRuntimeState }),
+    getPrinterSnapshotState: () => ({ ...printerSnapshotState }),
+    getVirtualPrinterConfigCache: () => ({ ...virtualPrinterConfigCache }),
+    installPrinterFromBackup,
+    listUsbPrinterPorts,
+    openPrinterPreferencesDialog,
+    openPrinterPropertiesDialog,
+    openSystemAddPrinterWizard,
+    pingHost,
+    printPrinterTestPage,
+    readSettings,
+    refreshPrinterSnapshot,
+    renameInstalledPrinter,
+    requestPrinterStateRefresh,
+    setVirtualPrinterConfigCache: updateVirtualPrinterConfigCache,
+    themeModes: THEME_MODES,
+    toBool,
+    uninstallPrinter,
+    updatePrinterStateWorkerConfig,
+    writeSettings,
+    writeVirtualPrinterConfig,
+  })
+  router.register()
 }
 
 function stopPrinterStateWorker() {
@@ -352,30 +351,6 @@ function startPrinterStateWorker({
       logWarn(`[printer-state] start failed: ${error?.message || error}`)
     }
   }, 0)
-}
-
-function getResourceRootPath() {
-  return app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resource')
-}
-
-function getWritableConfigRootPath() {
-  return app.isPackaged ? app.getPath('userData') : getResourceRootPath()
-}
-
-function getSettingsFilePath() {
-  return path.join(getWritableConfigRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
-}
-
-function getDefaultSettingsFilePath() {
-  return path.join(getResourceRootPath(), SYSTEM_SETTINGS_RELATIVE_PATH)
-}
-
-function getVirtualPrinterConfigPath() {
-  return path.join(getWritableConfigRootPath(), VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH)
-}
-
-function getDefaultVirtualPrinterConfigPath() {
-  return path.join(getResourceRootPath(), VIRTUAL_PRINTER_CONFIG_RELATIVE_PATH)
 }
 
 function getIndexFilePath(backupDir) {
@@ -623,166 +598,6 @@ async function renameInstalledPrinter({ printerName, newPrinterName }) {
     NEW_PRINTER_NAME: toPsSingleQuote(targetPrinterName),
   })
   return runPowerShellJson(script, { timeoutMs: POWERSHELL_TIMEOUT_MS })
-}
-
-function getDefaultBackupDir() {
-  const docsPath = sanitizeBackupDirPath(app.getPath('documents'))
-  if (docsPath) {
-    return path.join(docsPath, 'EleDrive', 'driver-backups')
-  }
-  const userDataPath = sanitizeBackupDirPath(app.getPath('userData'))
-  if (userDataPath) {
-    return path.join(userDataPath, 'driver-backups')
-  }
-  return path.join(process.cwd(), 'driver-backups')
-}
-
-function stripWindowsLongPathPrefix(rawPath) {
-  const text = String(rawPath || '').trim()
-  if (!text) return ''
-  if (process.platform !== 'win32') return text
-  if (text.startsWith('\\\\?\\UNC\\')) {
-    return `\\\\${text.slice('\\\\?\\UNC\\'.length)}`
-  }
-  if (text.startsWith('\\\\?\\')) {
-    return text.slice('\\\\?\\'.length)
-  }
-  return text
-}
-
-function sanitizeBackupDirPath(rawPath) {
-  const text = stripWindowsLongPathPrefix(rawPath).trim()
-  if (!text) return ''
-
-  if (process.platform === 'win32') {
-    const lower = text.toLowerCase()
-    if (lower === '\\\\?' || lower === '\\\\?\\' || lower === '\\?' || lower === '?') {
-      return ''
-    }
-    if (/[?*<>|"]/u.test(text)) {
-      return ''
-    }
-  }
-
-  return text
-}
-
-async function isDirectoryPath(targetPath) {
-  const value = sanitizeBackupDirPath(targetPath)
-  if (!value) return false
-  try {
-    const stat = await fs.stat(value)
-    return stat.isDirectory()
-  } catch {
-    return false
-  }
-}
-
-function getOrderedNonSystemDriveLetters() {
-  const letters = []
-  for (let code = 68; code <= 90; code += 1) {
-    letters.push(String.fromCharCode(code))
-  }
-  for (let code = 65; code <= 66; code += 1) {
-    letters.push(String.fromCharCode(code))
-  }
-  return letters.filter((letter) => letter !== 'C')
-}
-
-async function resolveForcedStartupBackupDir() {
-  if (process.platform !== 'win32') {
-    return getDefaultBackupDir()
-  }
-
-  for (const letter of getOrderedNonSystemDriveLetters()) {
-    const root = `${letter}:\\`
-    if (await isDirectoryPath(root)) {
-      return path.join(root, 'hstool', 'driver', 'printer')
-    }
-  }
-  return path.join('C:\\', 'hstool', 'driver', 'printer')
-}
-
-async function ensureStartupBackupDirSetting(settings = {}) {
-  const currentBackupDir = sanitizeBackupDirPath(settings?.backupDir)
-  if (currentBackupDir && await isDirectoryPath(currentBackupDir)) {
-    return {
-      ...settings,
-      backupDir: currentBackupDir,
-    }
-  }
-
-  const forcedBackupDir = await resolveForcedStartupBackupDir()
-  await fs.mkdir(forcedBackupDir, { recursive: true })
-  const saved = await writeSettings({
-    ...settings,
-    backupDir: forcedBackupDir,
-  })
-  return saved
-}
-
-function resolveBackupDirPath(backupDir, fallbackBackupDir = '') {
-  const primary = sanitizeBackupDirPath(backupDir)
-  if (primary) return primary
-  const fallback = sanitizeBackupDirPath(fallbackBackupDir)
-  if (fallback) return fallback
-  return getDefaultBackupDir()
-}
-
-async function ensureWritableBackupDir(backupDir, fallbackBackupDir = '') {
-  const candidates = [
-    resolveBackupDirPath(backupDir, fallbackBackupDir),
-    getDefaultBackupDir(),
-    path.join(app.getPath('userData'), 'driver-backups'),
-  ]
-  const uniqueCandidates = [...new Set(candidates.map((item) => sanitizeBackupDirPath(item)).filter(Boolean))]
-  let lastError = null
-  for (const candidate of uniqueCandidates) {
-    try {
-      await fs.mkdir(candidate, { recursive: true })
-      return candidate
-    } catch (error) {
-      lastError = error
-    }
-  }
-  throw lastError || new Error('No writable backup directory available.')
-}
-
-function normalizeVirtualPrinterConfig(raw = {}) {
-  const toLowerList = (value) => {
-    const list = Array.isArray(value) ? value : []
-    return [...new Set(list.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean))]
-  }
-
-  return {
-    keywords: toLowerList(raw?.keywords || DEFAULT_VIRTUAL_PRINTER_CONFIG.keywords),
-    exactPorts: toLowerList(raw?.exactPorts || raw?.ports?.exact || DEFAULT_VIRTUAL_PRINTER_CONFIG.exactPorts),
-    prefixPorts: toLowerList(raw?.prefixPorts || raw?.ports?.prefix || DEFAULT_VIRTUAL_PRINTER_CONFIG.prefixPorts),
-    containsPorts: toLowerList(raw?.containsPorts || raw?.ports?.contains || DEFAULT_VIRTUAL_PRINTER_CONFIG.containsPorts),
-  }
-}
-
-async function readVirtualPrinterConfig() {
-  try {
-    const fileText = await fs.readFile(getVirtualPrinterConfigPath(), 'utf-8')
-    return normalizeVirtualPrinterConfig(JSON.parse(fileText))
-  } catch {
-    try {
-      const fileText = await fs.readFile(getDefaultVirtualPrinterConfigPath(), 'utf-8')
-      return normalizeVirtualPrinterConfig(JSON.parse(fileText))
-    } catch {
-      return normalizeVirtualPrinterConfig(DEFAULT_VIRTUAL_PRINTER_CONFIG)
-    }
-  }
-}
-
-async function writeVirtualPrinterConfig(raw = {}) {
-  const normalized = normalizeVirtualPrinterConfig(raw)
-  const filePath = getVirtualPrinterConfigPath()
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
-  await fs.writeFile(filePath, JSON.stringify(normalized, null, 2), 'utf-8')
-  virtualPrinterConfigCache = normalized
-  return normalized
 }
 
 function updateVirtualPrinterConfigCache(nextConfig = null) {
@@ -1138,90 +953,6 @@ async function normalizeIndexDriverVersions(backupDir, indexObj) {
     ...indexObj,
     entries: nextEntries,
   })
-}
-
-function normalizeSettings(raw = {}) {
-  const parsed = raw && typeof raw === 'object' ? raw : {}
-  const feature = normalizeFeatureSettings(parsed?.feature)
-  const lanEnabled = toBool(parsed?.lanEnabled, feature.lan.discoveryEnabled)
-  feature.lan.discoveryEnabled = lanEnabled
-  const backupDir = resolveBackupDirPath(parsed?.backupDir)
-  const printServiceEnabled = toBool(parsed?.printServiceEnabled, false)
-  const printServicePort = normalizePrintServicePort(parsed?.printServicePort, DEFAULT_PRINT_SERVICE_PORT)
-  const printServiceAuthToken = String(parsed?.printServiceAuthToken || '').trim()
-  return {
-    backupDir,
-    themeMode: THEME_MODES.has(parsed.themeMode) ? parsed.themeMode : 'system',
-    lanEnabled,
-    printServiceEnabled,
-    printServicePort,
-    printServiceAuthToken,
-    feature,
-  }
-}
-
-function getFallbackSettings() {
-  const feature = normalizeFeatureSettings()
-  return {
-    backupDir: getDefaultBackupDir(),
-    themeMode: 'system',
-    lanEnabled: feature.lan.discoveryEnabled,
-    printServiceEnabled: false,
-    printServicePort: DEFAULT_PRINT_SERVICE_PORT,
-    printServiceAuthToken: '',
-    feature,
-  }
-}
-
-async function readJsonFileIfExists(filePath) {
-  try {
-    const fileText = await fs.readFile(filePath, 'utf-8')
-    return JSON.parse(fileText)
-  } catch {
-    return null
-  }
-}
-
-async function readSettings() {
-  const writableSettings = await readJsonFileIfExists(getSettingsFilePath())
-  if (writableSettings) {
-    return normalizeSettings(writableSettings)
-  }
-  const defaultSettings = await readJsonFileIfExists(getDefaultSettingsFilePath())
-  if (defaultSettings) {
-    return normalizeSettings(defaultSettings)
-  }
-  return getFallbackSettings()
-}
-
-async function writeSettings(nextSettings) {
-  const current = await readSettings()
-  const nextFeature = normalizeFeatureSettings(nextSettings?.feature || current?.feature || {})
-  const lanEnabled = typeof nextSettings?.lanEnabled === 'boolean'
-    ? nextSettings.lanEnabled
-    : toBool(current?.lanEnabled, nextFeature.lan.discoveryEnabled)
-  nextFeature.lan.discoveryEnabled = lanEnabled
-  const printServiceEnabled = typeof nextSettings?.printServiceEnabled === 'boolean'
-    ? nextSettings.printServiceEnabled
-    : toBool(current?.printServiceEnabled, false)
-  const printServicePort = normalizePrintServicePort(nextSettings?.printServicePort, current?.printServicePort)
-  const printServiceAuthToken = nextSettings?.printServiceAuthToken !== undefined
-    ? String(nextSettings.printServiceAuthToken || '').trim()
-    : String(current?.printServiceAuthToken || '').trim()
-  const backupDir = resolveBackupDirPath(nextSettings?.backupDir, current?.backupDir)
-  const merged = {
-    backupDir,
-    themeMode: THEME_MODES.has(nextSettings.themeMode) ? nextSettings.themeMode : current.themeMode || 'system',
-    lanEnabled,
-    printServiceEnabled,
-    printServicePort,
-    printServiceAuthToken,
-    feature: nextFeature,
-  }
-
-  await fs.mkdir(path.dirname(getSettingsFilePath()), { recursive: true })
-  await fs.writeFile(getSettingsFilePath(), JSON.stringify(merged, null, 2), 'utf-8')
-  return merged
 }
 
 function sanitizeFileName(name, fallback = 'archive') {
@@ -2155,312 +1886,22 @@ async function deleteBackupDriver({ printerName, backupDir }) {
   }
 }
 
-function getTrayIcon() {
-  const candidates = [
-    path.join(__dirname, TRAY_ICON_NAME),
-    path.join(app.getAppPath(), 'electron', TRAY_ICON_NAME),
-  ]
-
-  for (const candidate of candidates) {
-    if (!existsSync(candidate)) continue
-    const icon = nativeImage.createFromPath(candidate)
-    if (!icon.isEmpty()) {
-      return process.platform === 'win32' ? icon.resize({ width: 16, height: 16 }) : icon
-    }
-  }
-
-  return null
-}
-
-function getCustomProtocolPrefix() {
-  return `${CUSTOM_PROTOCOL_SCHEME}://`
-}
-
-function normalizeRoutePath(routePath = '') {
-  let text = String(routePath || '').trim()
-  if (!text) return '/'
-  if (text.startsWith('#')) {
-    text = text.slice(1)
-  }
-  if (!text.startsWith('/')) {
-    text = `/${text}`
-  }
-  text = text.replace(/\/{2,}/g, '/')
-
-  let queryText = ''
-  const queryIndex = text.indexOf('?')
-  if (queryIndex >= 0) {
-    queryText = text.slice(queryIndex + 1)
-    text = text.slice(0, queryIndex)
-  }
-  if (text.length > 1) {
-    text = text.replace(/\/+$/, '')
-  }
-  if (!KNOWN_ROUTE_PATHS.has(text)) {
-    text = '/'
-  }
-  return queryText ? `${text}?${queryText}` : text
-}
-
-function parseProtocolUrlToRoutePath(rawUrl = '') {
-  const value = String(rawUrl || '').trim()
-  if (!value || !value.toLowerCase().startsWith(getCustomProtocolPrefix())) {
-    return ''
-  }
-
-  let parsed = null
-  try {
-    parsed = new URL(value)
-  } catch {
-    return ''
-  }
-  if (String(parsed.protocol || '').toLowerCase() !== `${CUSTOM_PROTOCOL_SCHEME}:`) {
-    return ''
-  }
-
-  let routePath = String(parsed.searchParams.get('path') || parsed.searchParams.get('route') || '').trim()
-  if (!routePath) {
-    if (parsed.hash && parsed.hash.startsWith('#/')) {
-      routePath = parsed.hash.slice(1)
-    } else {
-      const host = decodeURIComponent(String(parsed.hostname || '').trim())
-      const pathname = decodeURIComponent(String(parsed.pathname || '').trim())
-      if (host && pathname && pathname !== '/') {
-        routePath = `/${host}${pathname}`
-      } else if (host) {
-        routePath = `/${host}`
-      } else {
-        routePath = pathname || '/'
-      }
-    }
-  }
-
-  const passthrough = new URLSearchParams(parsed.searchParams)
-  passthrough.delete('path')
-  passthrough.delete('route')
-  const normalized = normalizeRoutePath(routePath)
-  const hasQuery = normalized.includes('?')
-  const queryText = passthrough.toString()
-  if (!hasQuery && queryText) {
-    return `${normalized}?${queryText}`
-  }
-  return normalized
-}
-
-function findProtocolUrlFromArgv(argv = []) {
-  const prefix = getCustomProtocolPrefix()
-  const args = Array.isArray(argv) ? argv : []
-  return args.find((arg) => typeof arg === 'string' && arg.toLowerCase().startsWith(prefix)) || ''
-}
-
-function registerCustomProtocolClient() {
-  try {
-    if (process.defaultApp) {
-      const entryScript = process.argv[1] ? path.resolve(process.argv[1]) : ''
-      if (entryScript) {
-        app.setAsDefaultProtocolClient(CUSTOM_PROTOCOL_SCHEME, process.execPath, [entryScript])
-        return
-      }
-    }
-    app.setAsDefaultProtocolClient(CUSTOM_PROTOCOL_SCHEME)
-  } catch (error) {
-    logWarn(`[protocol] register failed: ${error?.message || error}`)
-  }
-}
-
-function openMainWindowByRoutePath(routePath = '/') {
-  const normalizedPath = normalizeRoutePath(routePath)
-  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.isLoadingMainFrame()) {
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    navigateMainWindow(normalizedPath)
-    return
-  }
-  showMainWindow(normalizedPath)
-}
-
-function handleProtocolOpen(rawUrl = '') {
-  const routePath = parseProtocolUrlToRoutePath(rawUrl)
-  if (!routePath) return false
-  if (app.isReady()) {
-    openMainWindowByRoutePath(routePath)
-  } else {
-    pendingProtocolRoutePath = routePath
-  }
-  return true
-}
-
-function navigateMainWindow(pathName = '/') {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-
-  const payload = { path: pathName || '/' }
-  const send = () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return
-    mainWindow.webContents.send('app:navigate', payload)
-  }
-
-  if (mainWindow.webContents.isLoadingMainFrame()) {
-    mainWindow.webContents.once('did-finish-load', send)
-  } else {
-    send()
-  }
-}
-
-function showMainWindow(pathName = '') {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    createMainWindow()
-  }
-  if (!mainWindow || mainWindow.isDestroyed()) return
-
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  if (!mainWindow.isVisible()) mainWindow.show()
-  mainWindow.focus()
-
-  if (pathName) {
-    navigateMainWindow(pathName)
-  }
-}
-
-function createTray() {
-  if (tray) return tray
-
-  const trayIcon = getTrayIcon()
-  if (!trayIcon) {
-    logWarn('[tray] tray icon not found, skip tray initialization.')
-    return null
-  }
-
-  tray = new Tray(trayIcon)
-  tray.setToolTip(APP_TITLE)
-
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: '打开主界面',
-      click: () => showMainWindow('/'),
-    },
-    {
-      label: '打印机管理',
-      click: () => showMainWindow('/printers'),
-    },
-    {
-      label: '系统设置',
-      click: () => showMainWindow('/settings'),
-    },
-    {
-      type: 'separator',
-    },
-    {
-      label: '退出',
-      click: () => {
-        appIsQuitting = true
-        app.quit()
-      },
-    },
-  ])
-
-  tray.setContextMenu(contextMenu)
-  tray.on('click', () => showMainWindow('/'))
-  return tray
-}
-
-function createMainWindow() {
-  const packagedAppRoot = app.getAppPath()
-  const preloadPath = app.isPackaged
-    ? path.join(packagedAppRoot, 'electron', 'preload.cjs')
-    : path.join(__dirname, 'preload.cjs')
-
-  const win = new BrowserWindow({
-    width: 1000,
-    height: 650,
-    show: false,
-    minWidth: 1000,
-    minHeight: 650,
-    maxWidth: 1000,
-    maxHeight: 650,
-    resizable: false,
-    maximizable: false,
-    fullscreenable: false,
-    title: APP_TITLE,
-    autoHideMenuBar: true,
-    webPreferences: {
-      preload: preloadPath,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-    },
-  })
-
-  mainWindow = win
-
-  win.on('close', (event) => {
-    if (appIsQuitting) return
-    event.preventDefault()
-    win.hide()
-  })
-
-  win.on('closed', () => {
-    if (mainWindow === win) {
-      mainWindow = null
-    }
-  })
-
-  win.on('page-title-updated', (event) => {
-    event.preventDefault()
-    win.setTitle(APP_TITLE)
-  })
-
-  if (isDev) {
-    const devUrl = process.env.VITE_DEV_SERVER_URL
-    win.loadURL(devUrl)
-    win.webContents.openDevTools({ mode: 'detach' })
-    win.webContents.on('did-fail-load', (_, code, desc, url) => {
-      logError(`[renderer-load-failed] code=${code} desc=${desc} url=${url}`)
-    })
-  } else {
-    win.loadFile(path.join(packagedAppRoot, 'dist', 'index.html'))
-  }
-
-  // Avoid white-screen flash: reveal window only after renderer finishes loading.
-  win.webContents.once('did-finish-load', () => {
-    if (mainWindow !== win || win.isDestroyed() || appIsQuitting) return
-    if (!win.isVisible()) win.show()
-    win.focus()
-  })
-
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
-    return { action: 'deny' }
-  })
-
-  return win
-}
-
-const startupProtocolUrl = findProtocolUrlFromArgv(process.argv)
-if (startupProtocolUrl) {
-  pendingProtocolRoutePath = parseProtocolUrlToRoutePath(startupProtocolUrl) || pendingProtocolRoutePath
-}
+appShell.captureStartupProtocol(process.argv)
 
 if (!gotSingleInstanceLock) {
   app.quit()
 } else {
   app.on('second-instance', (_, commandLine) => {
-    const protocolUrl = findProtocolUrlFromArgv(commandLine)
-    if (protocolUrl && handleProtocolOpen(protocolUrl)) {
-      return
-    }
-    if (app.isReady()) {
-      showMainWindow('/')
-      return
-    }
-    app.whenReady().then(() => showMainWindow('/'))
+    appShell.handleSecondInstance(commandLine)
   })
 
   app.on('open-url', (event, url) => {
     event.preventDefault()
-    handleProtocolOpen(url)
+    appShell.handleProtocolOpen(url)
   })
 
   app.whenReady().then(async () => {
-    registerCustomProtocolClient()
+    appShell.registerCustomProtocolClient()
     updateVirtualPrinterConfigCache(await readVirtualPrinterConfig())
     let startupSettings = await readSettings()
     startupSettings = await ensureStartupBackupDirSetting(startupSettings)
@@ -2480,285 +1921,11 @@ if (!gotSingleInstanceLock) {
       logWarn(`[print-service] apply startup settings failed: ${error?.message || error}`)
     }
 
-    upsertIpcHandler('app:get-version', () => app.getVersion())
-    upsertIpcHandler('updates:get-status', async () => ensureUpdateManager().getStatus())
-    upsertIpcHandler('updates:check-for-updates', async () => ensureUpdateManager().checkForUpdates())
-    upsertIpcHandler('updates:download-update', async () => ensureUpdateManager().downloadUpdate())
-    upsertIpcHandler('updates:quit-and-install', async () => {
-      const manager = ensureUpdateManager()
-      if (manager.getStatus()?.phase !== 'downloaded') {
-        return manager.quitAndInstall()
-      }
-      appIsQuitting = true
-      return manager.quitAndInstall()
-    })
+    registerIpcHandlers()
 
-    upsertIpcHandler('settings:get', async () => readSettings())
-    upsertIpcHandler('settings:get-virtual-printer-config', async () => ({
-      ...virtualPrinterConfigCache,
-    }))
-    upsertIpcHandler('settings:set-backup-dir', async (_, backupDir) => {
-      if (!backupDir || typeof backupDir !== 'string') {
-        throw new Error('Invalid backup directory path.')
-      }
-      const writableBackupDir = await ensureWritableBackupDir(backupDir)
-      const saved = await writeSettings({ backupDir: writableBackupDir })
-      await ensureBackupIndex(saved.backupDir)
-      updatePrinterStateWorkerConfig({ backupDir: saved.backupDir })
-      requestPrinterStateRefresh()
-      await refreshPrinterSnapshot({ broadcast: true })
-      return saved
-    })
-    upsertIpcHandler('settings:set-virtual-printer-config', async (_, payload) => {
-      const savedConfig = await writeVirtualPrinterConfig(payload || {})
-      updatePrinterStateWorkerConfig({
-        backupDir: printerSnapshotState.backupDir,
-        virtualPrinterConfig: savedConfig,
-      })
-      requestPrinterStateRefresh()
-      await refreshPrinterSnapshot({ broadcast: true })
-      broadcastLanState()
-      return {
-        ...savedConfig,
-      }
-    })
-    upsertIpcHandler('settings:set-theme-mode', async (_, themeMode) => {
-      if (!THEME_MODES.has(themeMode)) {
-        throw new Error('Invalid theme mode.')
-      }
-      return writeSettings({ themeMode })
-    })
-    upsertIpcHandler('settings:choose-backup-dir', async () => {
-      const result = await dialog.showOpenDialog({
-        title: '选择打印机驱动备份目录',
-        properties: ['openDirectory', 'createDirectory'],
-      })
-      if (result.canceled || !result.filePaths?.[0]) {
-        return null
-      }
-      return result.filePaths[0]
-    })
-    upsertIpcHandler('settings:open-backup-dir', async () => {
-      const settings = await readSettings()
-      const backupDir = await ensureWritableBackupDir(settings?.backupDir)
-      if (!backupDir) {
-        throw new Error('备份目录未配置')
-      }
-      const openResult = await shell.openPath(backupDir)
-      if (openResult) {
-        throw new Error(openResult)
-      }
-      return {
-        path: backupDir,
-        opened: true,
-      }
-    })
-
-    upsertIpcHandler('lan:get-state', async () => {
-      const runtime = ensureLanRuntime()
-      return filterVirtualOffersFromLanState(runtime.getState(), virtualPrinterConfigCache)
-    })
-    upsertIpcHandler('lan:set-enabled', async (_, payload) => {
-      const enabled = toBool(payload?.enabled, false)
-      const saved = await writeSettings({ lanEnabled: enabled })
-      const state = await applyLanSettings(saved)
-      return {
-        enabled: state.enabled,
-        startedAt: state.startedAt,
-      }
-    })
-    upsertIpcHandler('lan:list-nodes', async () => {
-      const runtime = ensureLanRuntime()
-      return runtime.listNodes()
-    })
-    upsertIpcHandler('lan:list-offers', async () => {
-      const runtime = ensureLanRuntime()
-      if (typeof runtime.syncOffers === 'function') {
-        await runtime.syncOffers()
-      }
-      return filterVirtualPrinterRows(runtime.listOffers(), virtualPrinterConfigCache)
-    })
-    upsertIpcHandler('lan:request-install', async (_, payload) => {
-      const runtime = ensureLanRuntime()
-      const task = await runtime.requestInstall(payload || {})
-      return {
-        taskId: task.taskId,
-        status: task.status,
-      }
-    })
-    upsertIpcHandler('lan:get-task', async (_, payload) => {
-      const runtime = ensureLanRuntime()
-      return runtime.getTask(payload?.taskId)
-    })
-    upsertIpcHandler('lan:cancel-task', async (_, payload) => {
-      const runtime = ensureLanRuntime()
-      return runtime.cancelTask(payload?.taskId)
-    })
-
-    upsertIpcHandler('print:service:get-state', async () => {
-      const runtime = ensurePrintSocketService()
-      return runtime.getState()
-    })
-    upsertIpcHandler('print:service:set-enabled', async (_, payload) => {
-      const enabled = toBool(payload?.enabled, false)
-      const saved = await writeSettings({
-        printServiceEnabled: enabled,
-        printServicePort: payload?.port,
-        printServiceAuthToken: payload?.authToken,
-      })
-      return applyPrintServiceSettings(saved)
-    })
-    upsertIpcHandler('print:service:get-client-info', async () => {
-      const runtime = ensurePrintSocketService()
-      return runtime.getClientInfo()
-    })
-    upsertIpcHandler('print:service:get-printer-list', async () => {
-      const runtime = ensurePrintSocketService()
-      return runtime.getPrinterList()
-    })
-    upsertIpcHandler('print:service:list-jobs', async () => {
-      const runtime = ensurePrintSocketService()
-      return runtime.listJobs()
-    })
-    upsertIpcHandler('print:service:get-job', async (_, payload) => {
-      const runtime = ensurePrintSocketService()
-      return runtime.getJob(payload?.taskId)
-    })
-    upsertIpcHandler('print:service:submit-job', async (_, payload) => {
-      const runtime = ensurePrintSocketService()
-      return runtime.submitJob(payload || {})
-    })
-    upsertIpcHandler('print:service:reprint', async (_, payload) => {
-      const runtime = ensurePrintSocketService()
-      return runtime.reprint(payload?.taskId)
-    })
-
-    upsertIpcHandler('printers:list-installed', async () => getInstalledPrinters())
-    upsertIpcHandler('printers:snapshot:get', async () => {
-      if (!printerSnapshotState.updatedAt) {
-        await refreshPrinterSnapshot({ broadcast: false })
-      }
-      return {
-        ...printerSnapshotState,
-      }
-    })
-    upsertIpcHandler('printers:list-usb-ports', async () => listUsbPrinterPorts())
-    upsertIpcHandler('printers:state:get', async () => ({ ...printerRuntimeState }))
-    upsertIpcHandler('printers:open-system-add-wizard', async () => openSystemAddPrinterWizard())
-    upsertIpcHandler('printers:open-properties', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      return openPrinterPropertiesDialog({
-        printerName: payload.printerName,
-      })
-    })
-    upsertIpcHandler('printers:open-preferences', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      return openPrinterPreferencesDialog({
-        printerName: payload.printerName,
-      })
-    })
-    upsertIpcHandler('printers:rename', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      if (!payload?.newPrinterName || typeof payload.newPrinterName !== 'string') {
-        throw new Error('Invalid new printer name.')
-      }
-      const result = await renameInstalledPrinter({
-        printerName: payload.printerName,
-        newPrinterName: payload.newPrinterName,
-      })
-      requestPrinterStateRefresh()
-      await refreshPrinterSnapshot({ broadcast: true })
-      return result
-    })
-    upsertIpcHandler('printers:backup-driver', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      const settings = await readSettings()
-      const result = await backupPrinterDriver({
-        printerName: payload.printerName,
-        backupDir: payload.backupDir || settings.backupDir,
-      })
-      await refreshPrinterSnapshot({ broadcast: true })
-      return result
-    })
-    upsertIpcHandler('printers:install', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      const settings = await readSettings()
-      const result = await installPrinterFromBackup({
-        printerName: payload.printerName,
-        backupDir: settings.backupDir,
-        targetPrinterName: payload.targetPrinterName || '',
-        portHostAddressOverride: payload.portHostAddressOverride || '',
-      })
-      requestPrinterStateRefresh()
-      await refreshPrinterSnapshot({ broadcast: true })
-      return result
-    })
-    upsertIpcHandler('printers:ping-host', async (_, payload) => {
-      const host = String(payload?.host || '').trim()
-      if (!host) {
-        throw new Error('Invalid host.')
-      }
-      return pingHost(host)
-    })
-    upsertIpcHandler('printers:uninstall', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      const result = await uninstallPrinter({
-        printerName: payload.printerName,
-      })
-      requestPrinterStateRefresh()
-      await refreshPrinterSnapshot({ broadcast: true })
-      return result
-    })
-    upsertIpcHandler('printers:print-test-page', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      return printPrinterTestPage({
-        printerName: payload.printerName,
-      })
-    })
-    upsertIpcHandler('printers:backup-delete', async (_, payload) => {
-      if (!payload?.printerName || typeof payload.printerName !== 'string') {
-        throw new Error('Invalid printer name.')
-      }
-      const settings = await readSettings()
-      const result = await deleteBackupDriver({
-        printerName: payload.printerName,
-        backupDir: settings.backupDir,
-      })
-      await refreshPrinterSnapshot({ broadcast: true })
-      return result
-    })
-
-    upsertIpcHandler('drivers:index:get', async () => {
-      if (!printerSnapshotState.updatedAt) {
-        await refreshPrinterSnapshot({ broadcast: false })
-      }
-      return {
-        backupDir: printerSnapshotState.backupDir,
-        index: {
-          version: 1,
-          updatedAt: printerSnapshotState.updatedAt,
-          entries: printerSnapshotState.driverIndexEntries,
-        },
-      }
-    })
-
-    const win = createMainWindow()
+    const win = appShell.createWindow()
     updateManager = new UpdateManager(win)
-    createTray()
+    appShell.createTray()
     startPrinterStateWorker({
       backupDir: startupSettings.backupDir,
       virtualPrinterConfig: virtualPrinterConfigCache,
@@ -2766,23 +1933,16 @@ if (!gotSingleInstanceLock) {
     void refreshPrinterSnapshot({ broadcast: true }).catch((error) => {
       logWarn(`[printer-snapshot] bootstrap refresh failed: ${error?.message || error}`)
     })
-    if (pendingProtocolRoutePath) {
-      const pendingPath = pendingProtocolRoutePath
-      pendingProtocolRoutePath = ''
-      openMainWindowByRoutePath(pendingPath)
-    }
+    appShell.openPendingProtocolRoute()
 
     app.on('activate', () => {
-      showMainWindow('/')
+      appShell.show('/')
     })
   })
 
   app.on('before-quit', () => {
-    appIsQuitting = true
-    if (tray) {
-      tray.destroy()
-      tray = null
-    }
+    appShell.markQuitting()
+    appShell.destroyTray()
     stopPrinterStateWorker()
     if (lanRuntime) {
       void lanRuntime.dispose()
@@ -2798,5 +1958,3 @@ if (!gotSingleInstanceLock) {
     }
   })
 }
-
-
