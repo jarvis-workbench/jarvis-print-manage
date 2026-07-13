@@ -43,6 +43,42 @@
         }
       }
     }
+    function Normalize-DriverKey {
+      param([string]$Value)
+      return ([string]$Value).Trim().ToLowerInvariant()
+    }
+    function Resolve-DriverInfPath {
+      param([string]$InfPath)
+      $rawPath = [string]$InfPath
+      if (-not $rawPath) {
+        return ''
+      }
+      if ($rawPath -match '(?i)^[a-z]:\\') {
+        return $rawPath
+      }
+      if ($rawPath -match '(?i)\.inf$') {
+        $candidate = Join-Path $env:WINDIR (Join-Path 'INF' $rawPath)
+        if (Test-Path -LiteralPath $candidate) {
+          return $candidate
+        }
+      }
+      return $rawPath
+    }
+
+    $driverMap = @{}
+    foreach ($driver in (Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object Name, Manufacturer, MajorVersion, DriverVersion, InfPath, PrinterEnvironment)) {
+      $driverKey = Normalize-DriverKey $driver.Name
+      if ($driverKey -and -not $driverMap.ContainsKey($driverKey)) {
+        $driverMap[$driverKey] = $driver
+      }
+    }
+    $wmiDriverMap = @{}
+    foreach ($wmiDriver in (Get-CimInstance -ClassName Win32_PrinterDriver -ErrorAction SilentlyContinue)) {
+      $driverKey = Normalize-DriverKey $wmiDriver.Name
+      if ($driverKey -and -not $wmiDriverMap.ContainsKey($driverKey)) {
+        $wmiDriverMap[$driverKey] = $wmiDriver
+      }
+    }
 
     $printers = @(
       Get-Printer -ErrorAction SilentlyContinue |
@@ -54,6 +90,22 @@
         $resolvedWorkOffline = [bool]$_.WorkOffline
         if ($wmi -and $wmi.WorkOffline -ne $null) {
           $resolvedWorkOffline = $resolvedWorkOffline -or [bool]$wmi.WorkOffline
+        }
+        $driverKey = Normalize-DriverKey $_.DriverName
+        $driver = $null
+        if ($driverKey -and $driverMap.ContainsKey($driverKey)) {
+          $driver = $driverMap[$driverKey]
+        }
+        $wmiDriver = $null
+        if ($driverKey -and $wmiDriverMap.ContainsKey($driverKey)) {
+          $wmiDriver = $wmiDriverMap[$driverKey]
+        }
+        $driverInfPath = ''
+        if ($driver) {
+          $driverInfPath = Resolve-DriverInfPath $driver.InfPath
+        }
+        if (-not $driverInfPath -and $wmiDriver) {
+          $driverInfPath = Resolve-DriverInfPath $wmiDriver.InfName
         }
         $portNameText = [string]$_.PortName
         $isUsbPort = $portNameText -match '^(?i)(USB\d*|DOT4\d*)'
@@ -127,6 +179,18 @@
           WmiPrinterState = if ($wmi) { $wmi.PrinterState } else { $null }
           WmiExtendedPrinterStatus = if ($wmi) { $wmi.ExtendedPrinterStatus } else { $null }
           WmiDetectedErrorState = if ($wmi) { $wmi.DetectedErrorState } else { $null }
+          Driver = if ($driver -or $wmiDriver) {
+            [PSCustomObject]@{
+              Name = if ($driver) { $driver.Name } elseif ($wmiDriver) { $wmiDriver.Name } else { [string]$_.DriverName }
+              Manufacturer = if ($driver) { $driver.Manufacturer } elseif ($wmiDriver) { [string]$wmiDriver.Manufacturer } else { '' }
+              MajorVersion = if ($driver) { $driver.MajorVersion } else { $null }
+              DriverVersion = if ($driver) { $driver.DriverVersion } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['DriverVersion']) { [string]$wmiDriver.DriverVersion } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['Version']) { [string]$wmiDriver.Version } else { '' }
+              InfPath = $driverInfPath
+              Environment = if ($driver) { $driver.PrinterEnvironment } elseif ($wmiDriver -and $wmiDriver.PSObject.Properties['SupportedPlatform']) { [string]$wmiDriver.SupportedPlatform } else { '' }
+            }
+          } else {
+            $null
+          }
         }
       }
     )

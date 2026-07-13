@@ -185,24 +185,31 @@ function toAvailability(printer) {
 function normalizePrinters(raw) {
   const list = Array.isArray(raw) ? raw : raw ? [raw] : []
   return list
-    .map((item) => ({
-      name: String(pick(item, ['name', 'Name'], '')),
-      driverName: String(pick(item, ['driverName', 'DriverName'], '')),
-      portName: String(pick(item, ['portName', 'PortName'], '')),
-      printerStatus: pick(item, ['printerStatus', 'PrinterStatus', 'wmiPrinterStatus', 'WmiPrinterStatus'], ''),
-      workOffline: toBool(pick(item, ['workOffline', 'WorkOffline'], false)) || toBool(pick(item, ['wmiWorkOffline', 'WmiWorkOffline'], false)),
-      usbDisconnected: toBool(pick(item, ['usbDisconnected', 'UsbDisconnected'], false)),
-      queueStatus: pick(item, ['queueStatus', 'QueueStatus'], ''),
-      shared: toBool(pick(item, ['shared', 'Shared'], false)),
-      shareName: String(pick(item, ['shareName', 'ShareName'], '')),
-      pnpDeviceId: String(pick(item, ['pnpDeviceId', 'PnpDeviceId'], '')),
-      hardwareIds: normalizeStringList(pick(item, ['hardwareIds', 'HardwareIds', 'hardwareIdList'], [])),
-      usbVid: String(pick(item, ['usbVid', 'UsbVid'], '')),
-      usbPid: String(pick(item, ['usbPid', 'UsbPid'], '')),
-      usbVidPid: String(pick(item, ['usbVidPid', 'UsbVidPid'], '')),
-      deviceSerial: String(pick(item, ['deviceSerial', 'DeviceSerial'], '')),
-      availability: toAvailability(item),
-    }))
+    .map((item) => {
+      const driver = pick(item, ['driver', 'Driver'], null) || {}
+      return {
+        name: String(pick(item, ['name', 'Name'], '')),
+        driverName: String(pick(item, ['driverName', 'DriverName'], '')),
+        portName: String(pick(item, ['portName', 'PortName'], '')),
+        printerStatus: pick(item, ['printerStatus', 'PrinterStatus', 'wmiPrinterStatus', 'WmiPrinterStatus'], ''),
+        workOffline: toBool(pick(item, ['workOffline', 'WorkOffline'], false)) || toBool(pick(item, ['wmiWorkOffline', 'WmiWorkOffline'], false)),
+        usbDisconnected: toBool(pick(item, ['usbDisconnected', 'UsbDisconnected'], false)),
+        queueStatus: pick(item, ['queueStatus', 'QueueStatus'], ''),
+        shared: toBool(pick(item, ['shared', 'Shared'], false)),
+        shareName: String(pick(item, ['shareName', 'ShareName'], '')),
+        pnpDeviceId: String(pick(item, ['pnpDeviceId', 'PnpDeviceId'], '')),
+        hardwareIds: normalizeStringList(pick(item, ['hardwareIds', 'HardwareIds', 'hardwareIdList'], [])),
+        usbVid: String(pick(item, ['usbVid', 'UsbVid'], '')),
+        usbPid: String(pick(item, ['usbPid', 'UsbPid'], '')),
+        usbVidPid: String(pick(item, ['usbVidPid', 'UsbVidPid'], '')),
+        deviceSerial: String(pick(item, ['deviceSerial', 'DeviceSerial'], '')),
+        driverManufacturer: String(pick(driver, ['manufacturer', 'Manufacturer'], '')),
+        driverVersion: String(pick(driver, ['driverVersion', 'DriverVersion'], '')),
+        systemInfPath: String(pick(driver, ['infPath', 'InfPath'], '')),
+        driverEnvironment: String(pick(driver, ['environment', 'Environment'], '')),
+        availability: toAvailability(item),
+      }
+    })
     .filter((item) => item.name)
     .sort((a, b) => a.name.localeCompare(b.name))
 }
@@ -296,9 +303,9 @@ function buildManagePrinters(runtimeState, indexEntries) {
       portName: runtimePortName,
       portHostAddress: resolvedPortHost,
       driverName: String(runtimeItem?.driverName || ''),
-      manufacturer: '',
-      driverVersion: '',
-      systemInfPath: '',
+      manufacturer: String(runtimeItem?.driverManufacturer || ''),
+      driverVersion: String(runtimeItem?.driverVersion || ''),
+      systemInfPath: String(runtimeItem?.systemInfPath || ''),
       infRelativePath: '',
       printerStatus: runtimeItem?.printerStatus ?? '',
       workOffline: toBool(runtimeItem?.workOffline),
@@ -369,7 +376,7 @@ function buildManagePrinters(runtimeState, indexEntries) {
 
 function buildSignature(state) {
   const runtimePart = state.printers
-    .map((item) => `${item.name}|${item.driverName}|${item.portName}|${item.availability}|${item.printerStatus}|${item.queueStatus}|${item.workOffline ? 1 : 0}|${item.usbDisconnected ? 1 : 0}`)
+    .map((item) => `${item.name}|${item.driverName}|${item.driverVersion}|${item.systemInfPath}|${item.portName}|${item.availability}|${item.printerStatus}|${item.queueStatus}|${item.workOffline ? 1 : 0}|${item.usbDisconnected ? 1 : 0}`)
     .join('||')
   const portPart = state.ports
     .map((item) => `${item.name}|${item.printerHostAddress}|${item.portNumber}`)
