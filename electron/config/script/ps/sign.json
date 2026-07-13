@@ -65,8 +65,8 @@
     },
     "printer-runtime-state": {
       "file": "printer-runtime-state.scps1",
-      "hash": "a3bef0a45cd0023ef99a1d219ca2a91ed93e233b2e490e671e549b8c27020fbe",
-      "appHash": "ece49725b69552c2162a6c3a651a52af8944edac47a2d253247143f7ccd9c583"
+      "hash": "e7c4835012ddedf1f1f1f20fab83b9135785400372339803f14010eca2c3d0de",
+      "appHash": "ddd211fc7a1ddf164f53a16a09bb6a63c6a9aed9cfb9f32aded680ad1c0b33da"
     },
     "printer-uninstall": {
       "file": "printer-uninstall.scps1",
